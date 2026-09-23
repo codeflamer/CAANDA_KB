@@ -1,0 +1,16 @@
+[project]
+name = "canadaguidance"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "chromadb>=1.5.9",
+    "httpx>=0.28.1",
+    "mistralai>=2.10.1",
+    "numpy>=2.5.3",
+    "openai>=3.16.2",
+    "pandas>=3.0.6",
+    "requests>=2.34.2",
+]
