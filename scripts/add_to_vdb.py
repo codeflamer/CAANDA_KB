@@ -26,7 +26,7 @@ def load_pages(run_dir):
             if not text.strip():
                 continue
             pages.append({**row, "text": text})
-            # global page
+            global page
             # page.update({**row, "text": text}) 
             counter +=1
     return pages
