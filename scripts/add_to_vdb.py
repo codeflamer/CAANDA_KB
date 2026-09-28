@@ -228,5 +228,5 @@ def call_rag(question):
 
 
 if __name__ == "__main__":
-    # print(call_rag("what to i need to do to study in canada?"))
+    print(call_rag("what to i need to do to study in canada?"))
     call_rag("Can I bring my family to Canada to work?")
