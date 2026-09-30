@@ -183,10 +183,10 @@ def get_model_result(client,col, model,question,embed_query, k=5, where=None):
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": f"Sources:\n{context}\n\nQuestion: {question}"}]
     r = client.chat.completions.create(model=model, messages=messages)
-    print(r.choices[0].message.content)
-    print("\nSources:")
-    for i, h in enumerate(hits, 1):
-        print(f"  [{i}] {h['score']:.2f}  {h['heading'][:50]}  {h['url']}")
+    # print(r.choices[0].message.content)
+    # print("\nSources:")
+    # for i, h in enumerate(hits, 1):
+    #     print(f"  [{i}] {h['score']:.2f}  {h['heading'][:50]}  {h['url']}")
     return hits, r.choices[0].message.content
 
 # ## Basic rag
@@ -210,7 +210,7 @@ def call_rag(question):
     
     try:
         col = open_collection(CHROMA_PATH, COLLECTION, EMBED_MODEL)
-        print("works")
+        # print("works")
     except Exception:
         ##Build the collection
         pages = load_pages(RUN_DIR)
@@ -224,9 +224,10 @@ def call_rag(question):
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or getpass.getpass("OpenAI API key: "), max_retries=3)
     model = "gpt-5-mini" 
     retrieved_hits, response = get_model_result(client, col, model, question, embed_query, k=5, where=None)
-    return response
+    return retrieved_hits, response
 
 
 if __name__ == "__main__":
-    print(call_rag("what to i need to do to study in canada?"))
-    call_rag("Can I bring my family to Canada to work?")
+    # print(call_rag("what to i need to do to study in canada?"))
+    retrieved_hits, model_answer = call_rag("Do you need a PAL/TAL when applying for a study permit if you received a scholarship from Global Affairs Canada?")
+    print(retrieved_hits)
