@@ -1,0 +1,9 @@
+# Baseline + index-time dedup: chunks with the same words (e.g. PGWP text repeated on every DLI detail page)
+# are stored once, with n_copies and also_urls in the metadata.
+embedding_model: chroma-default-all-MiniLM-L6-v2
+chunking_method: section_words
+chunk_size: 180
+chunk_overlap: 30
+add_heading_path: true
+dedupe_chunks: true
+top_k_retrieve: 50

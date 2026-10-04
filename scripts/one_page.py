@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import unicodedata
+import re
 # import httpx
 # from bs4 import BeautifulSoup
 # from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse, urlunparse
@@ -70,6 +72,7 @@ print(gold_standard.keys())
 # dict_keys(['id', 'question', 'answer', 'category', 'answerable', 'valid_as_of', 'valid_until', 'stale_risk', 'source', 'verified_by', 'gold_passages'])
 
 golds = gold_standard.get("gold_passages")
+print(golds[0])
 print(golds)
 
 print(gold_standard.keys())
@@ -77,6 +80,14 @@ print(gold_standard.keys())
 ## Play with rigthpage and right passage
 # dict_keys(['id', 'category', 'question', 'answer', 'chunks', 'url_retrieved', 'quote_retrieved', 'url_rank', 'quote_ranks', 'verdict', 'reason', 'grounded', 'unsupported_claims', 'failure_type'])
 # print(list(items[0].keys()))
+QUOTE_MAP = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+
+def norm(s):
+    # Compare word tokens only: the crawler rewrites list markup ("criteria : - Associate of Arts"),
+    # so punctuation/bullets/whitespace differ from the quote as it appears on the page.
+    s = unicodedata.normalize("NFKC", s or "").translate(QUOTE_MAP).lower()
+    return " " + " ".join(re.findall(r"\w+", s)) + " "
+
 print(items[0]["question"])
 print(items[0]["category"])
 
@@ -93,3 +104,11 @@ url_rank = next((c["rank"] for c in chunks if c["url"].strip() in ok_urls), None
 
 url_rank = next((c["rank"] for c in chunks if c["url"].strip() in ok_urls), None)
 print(url_rank)
+
+quote = norm(golds[0].get("quote"))
+print(quote)
+
+print(quote in norm(chunks[0].get("text")))
+
+quote_ranks =  next((c["rank"] for c in chunks if quote in c["text"]),None)
+print(quote_ranks)

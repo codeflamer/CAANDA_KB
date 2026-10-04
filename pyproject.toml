@@ -13,4 +13,5 @@ dependencies = [
     "openai>=3.16.2",
     "pandas>=3.0.6",
     "requests>=2.34.2",
+    "sentence-transformers>=6.1.0",
 ]

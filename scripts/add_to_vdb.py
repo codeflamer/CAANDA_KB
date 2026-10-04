@@ -16,19 +16,18 @@ def load_pages(run_dir):
     run_dir = Path(run_dir)
     pages = []
     counter = 0 # to grab just 10 pages
-    if counter <= 10:
-        for line in (run_dir / "manifest.jsonl").read_text().splitlines():
-            row = json.loads(line)
-            # print(row)
-            if row.get("status") != 200 or not row.get("key"):
-                continue
-            text = (run_dir / f"{row['key']}" /f"{row['key']}.txt").read_text(encoding="utf-8")
-            if not text.strip():
-                continue
-            pages.append({**row, "text": text})
-            global page
-            # page.update({**row, "text": text}) 
-            counter +=1
+    for line in (run_dir / "manifest.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        # print(row)
+        if row.get("status") != 200 or not row.get("key"):
+            continue
+        text = (run_dir / f"{row['key']}" /f"{row['key']}.txt").read_text(encoding="utf-8")
+        if not text.strip():
+            continue
+        pages.append({**row, "text": text})
+        global page
+        # page.update({**row, "text": text}) 
+
     return pages
 
 # load_pages("../data/raw/2026-09-20")

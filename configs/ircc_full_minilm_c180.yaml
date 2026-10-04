@@ -1,0 +1,7 @@
+# Baseline: mirrors scripts/add_to_vdb.py (chunk sizes are in WORDS, like chunk_page).
+embedding_model: chroma-default-all-MiniLM-L6-v2
+chunking_method: section_words
+chunk_size: 180
+chunk_overlap: 30
+add_heading_path: true
+top_k_retrieve: 50

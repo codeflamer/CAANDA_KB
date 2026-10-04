@@ -1,0 +1,10 @@
+# Dedup index + cross-encoder rerank of a 100-chunk pool (scored on the reranked top 50). Reuses the dedup collection (no re-index).
+collection: ircc_full_minilm_c180_dedup
+embedding_model: chroma-default-all-MiniLM-L6-v2
+chunking_method: section_words
+chunk_size: 180
+chunk_overlap: 30
+add_heading_path: true
+dedupe_chunks: true
+top_k_retrieve: 100
+reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
