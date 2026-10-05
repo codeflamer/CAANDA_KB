@@ -5,6 +5,8 @@ Usage (from repo root):
     .venv/Scripts/python retrieval_eval.py eval    --config configs/ircc_full_minilm_c180.yaml --change "what I changed"
     .venv/Scripts/python retrieval_eval.py compare [<run_id_1> <run_id_2>]   (default: previous vs latest run)
     .venv/Scripts/python retrieval_eval.py table   [run_id ...]
+    .venv/Scripts/python retrieval_eval.py multihop --config configs/<name>.yaml --change "what I changed" [--validate-only]
+    .venv/Scripts/python retrieval_eval.py multihop-compare <run_id_1> <run_id_2>
 """
 import argparse
 import hashlib
@@ -33,10 +35,12 @@ RUNS_FILE = ROOT / "retrieval_runs.jsonl"
 
 # Reuse the chunking from the main RAG code so the chunks are identical.
 sys.path.insert(0, str(ROOT / "scripts"))
-from add_to_vdb import chunk_page  # noqa: E402
+from add_to_vdb import chunk_page, split_sections  # noqa: E402
 
 DEFAULTS = {"chunking_method": "section_words", "add_heading_path": True, "top_k_retrieve": 50, "reranker": None,
-            "dedupe_chunks": False, "query_prefix": ""}
+            "dedupe_chunks": False, "query_prefix": "",
+            "split_queries": False, "fusion": "rrf", "subquery_filter": False,
+            "expand_section": False, "expand_max_words": 450}
 # Settings baked into a collection at index time; eval refuses a config that disagrees with the collection.
 INDEX_SETTINGS = ("embedding_model", "chunking_method", "chunk_size", "chunk_overlap", "add_heading_path", "dedupe_chunks")
 
@@ -190,9 +194,27 @@ def norm_url(u):
 
 
 # ---------- coverage ----------
-def load_eval_items():
-    items = [json.loads(l) for l in EVAL_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+def load_eval_items(path=EVAL_FILE):
+    items = [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
     return [i for i in items if i.get("gold_passages")]  # unanswerable items have no gold: skip
+
+
+def eval_set_fingerprint(items):
+    """Short hash of what is scored: ids, questions and gold passages. Adding a question or editing a quote
+    changes it, so runs on different eval set versions can be told apart."""
+    scored = sorted(({"id": i["id"], "question": i["question"], "gold_passages": i["gold_passages"]} for i in items),
+                    key=lambda x: x["id"])
+    return hashlib.sha256(json.dumps(scored, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+
+
+def eval_set_labels(runs):
+    """{eval_set_hash: 'v1', 'v2', ...} in order of first appearance."""
+    labels = {}
+    for r in runs:
+        h = r.get("eval_set_hash")
+        if h and h not in labels:
+            labels[h] = f"v{len(labels) + 1}"
+    return labels
 
 
 def coverage_check(items, indexed_urls, n_pages):
@@ -233,6 +255,123 @@ def rerank(reranker, question, hits):
             for i, (h, s) in enumerate(order, 1)]
 
 
+# Split points: sentence ends, a spaced dash, or a comma that starts a new question clause
+# (", and am I ...", ", does that mean ...", ", can I ..."). Rule-based, no LLM, and blind to the category.
+SPLIT_RE = re.compile(
+    r"(?<=[?.!])\s+|\s+[—–-]\s+"
+    r"|,\s+(?:and\s+|but\s+|so\s+)?(?=(?:can|could|does|do|did|is|am|are|will|would|should|what|how)\b)",
+    re.IGNORECASE)
+
+
+def split_question(question, min_words=4):
+    """Sub-queries of a compound question; [] if it doesn't split into 2+ parts of min_words+ words."""
+    parts = [p.strip(" ,;?") for p in SPLIT_RE.split(question)]
+    parts = [p for p in parts if len(p.split()) >= min_words]
+    return parts if len(parts) >= 2 else []
+
+
+STOPWORDS = set("""a an the i i'm me my you your it its that this these those is am are was were be been do does did
+can could will would should may might have has had to of for in on at by with from about as if or and but so not no
+just still even also anything something really actually then than there here what how when where which who why""".split())
+
+
+def is_vague(part, min_content_words=3):
+    """A piece with too few content words to retrieve on its own, e.g. 'does that change anything for me'."""
+    return sum(w not in STOPWORDS for w in re.findall(r"[a-z']+", part.lower())) < min_content_words
+
+
+def make_queries(question, cfg):
+    """Queries to run for one question; more than one means the question was split.
+    Without subquery_filter: full question + every piece. With it: only the non-vague pieces
+    (the full question would count the first piece twice); back to the full question if < 2 pieces survive."""
+    pieces = split_question(question) if cfg["split_queries"] else []
+    if not pieces:
+        return [question]
+    if not cfg["subquery_filter"]:
+        return [question, *pieces]
+    pieces = [p for p in pieces if not is_vague(p)]
+    return pieces if len(pieces) >= 2 else [question]
+
+
+def round_robin_fuse(ranked_lists, k):
+    """Every list's #1, then every list's #2, ... (skipping chunks already taken). Top k, re-ranked 1..k."""
+    seen, order = set(), []
+    for i in range(max(len(hits) for hits in ranked_lists)):
+        for hits in ranked_lists:
+            if i < len(hits) and hits[i]["chunk_id"] not in seen:
+                seen.add(hits[i]["chunk_id"])
+                order.append(hits[i])
+    drop = ("retrieval_rank", "rerank_score")  # refer to one input list only, misleading after fusion
+    return [{**{key: v for key, v in h.items() if key not in drop}, "rank": i} for i, h in enumerate(order[:k], 1)]
+
+
+def rrf_fuse(ranked_lists, k, c=60):
+    """Reciprocal rank fusion: chunk score = sum of 1/(c + rank) over the lists it appears in. Top k, re-ranked 1..k."""
+    fused, best = defaultdict(float), {}
+    for hits in ranked_lists:
+        for h in hits:
+            fused[h["chunk_id"]] += 1 / (c + h["rank"])
+            best.setdefault(h["chunk_id"], h)
+    order = sorted(fused, key=lambda cid: -fused[cid])[:k]
+    drop = ("retrieval_rank", "rerank_score")  # refer to one input list only, misleading after fusion
+    return [{**{key: v for key, v in best[cid].items() if key not in drop}, "rank": i, "rrf_score": round(fused[cid], 5)}
+            for i, cid in enumerate(order, 1)]
+
+
+# ---------- section expansion ("small-to-big") ----------
+def build_section_index(pages, cfg):
+    """chunk_id -> the section it came from. Replays chunk_page's windowing (no dedup) so the section and the
+    chunk's word offset are exact; dedup keeps original chunk_ids, so this also works for dedup collections."""
+    size, step = cfg["chunk_size"], cfg["chunk_size"] - cfg["chunk_overlap"]
+    idx = {}
+    for page in pages:
+        ids, n = [], 0
+        for s, (heading, body) in enumerate(split_sections(page["text"])):
+            words = body.split()
+            for start in range(0, max(len(words), 1), step):
+                if not words[start : start + size]:
+                    continue
+                chunk_id = f"{page['key']}_{page.get('content_hash', 'x')}_{n}"
+                idx[chunk_id] = {"section": f"{page['url']}#{s}", "words": words, "start": start,
+                                 "head": f"{page.get('title') or ''} | {heading}"}
+                ids.append(chunk_id)
+                n += 1
+                if start + size >= len(words):
+                    break
+        expected = [c["id"] for c in chunk_page(page, max_words=size, overlap_words=cfg["chunk_overlap"])]
+        assert ids == expected, f"section index out of sync with chunk_page for {page['url']}"
+    return idx
+
+
+def expand_hit(hit, idx, cfg):
+    """Replace a chunk by its whole section, or by an expand_max_words window centred on the chunk if the
+    section is longer. Chunks not in the index (shouldn't happen) are returned unchanged."""
+    e = idx.get(hit["chunk_id"])
+    if e is None:
+        return {**hit, "unit": hit["chunk_id"]}
+    words, cap = e["words"], cfg["expand_max_words"]
+    if len(words) <= cap:
+        lo, hi = 0, len(words)
+    else:
+        end = min(e["start"] + cfg["chunk_size"], len(words))
+        lo = max(0, e["start"] - (cap - (end - e["start"])) // 2)
+        hi = min(len(words), lo + cap)
+        lo = max(0, hi - cap)
+    body = " ".join(words[lo:hi])
+    text = f"{e['head']}\n{body}".strip() if cfg["add_heading_path"] else body
+    return {**hit, "text": text, "unit": f"{e['section']}[{lo}:{hi}]", "expanded_words": hi - lo}
+
+
+def expand_and_collapse(hits, idx, cfg):
+    """Expand every hit, keep the first (best-ranked) hit per unit, re-rank 1..n."""
+    seen, out = set(), []
+    for h in (expand_hit(h, idx, cfg) for h in hits):
+        if h["unit"] not in seen:
+            seen.add(h["unit"])
+            out.append({**h, "chunk_rank": h["rank"], "rank": len(out) + 1})
+    return out
+
+
 def score(item, hits, indexed_urls, all_chunk_texts):
     """Rank of each gold quote in `hits`, the question rank (worst quote), and the miss group."""
     hit_texts = [norm_text(h["text"]) for h in hits]  # hits are in rank order, so position == rank
@@ -264,6 +403,12 @@ def metrics(rows):
     }
 
 
+def ctx_words5(rows):
+    """Mean words in the top-5 units: Hit@5 with bigger units (section expansion) costs more context."""
+    vals = [r["ctx_words5"] for r in rows if not r.get("error") and "ctx_words5" in r]
+    return round(sum(vals) / len(vals)) if vals and len(vals) == len([r for r in rows if not r.get("error")]) else None
+
+
 def read_runs():
     if not RUNS_FILE.exists():
         return []
@@ -277,13 +422,14 @@ def config_diff(old, new):
     return {k: [old.get(k), new.get(k)] for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)}
 
 
-def cmd_eval(args):
-    name, cfg = load_config(args.config)
+def open_eval_collection(name, cfg, config_path):
+    """Open the collection, check it was built with the config's index settings, and collect what scoring needs.
+    Returns (col, page_urls, indexed_urls, all_chunk_texts, section_idx). Shared by eval and multihop."""
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     try:
         col = client.get_collection(name, embedding_function=None)
     except Exception:
-        sys.exit(f"Collection {name!r} not found. Run: python retrieval_eval.py index --config {args.config}")
+        sys.exit(f"Collection {name!r} not found. Run: python retrieval_eval.py index --config {config_path}")
     built = {**DEFAULTS, **json.loads((col.metadata or {}).get("config", "{}"))}
     mismatch = {k: [built.get(k), cfg[k]] for k in INDEX_SETTINGS if built.get(k) != cfg[k]}
     if mismatch:
@@ -293,14 +439,48 @@ def cmd_eval(args):
     # a deduplicated chunk also stands for the pages listed in also_urls
     page_urls = {u for m in everything["metadatas"] for u in [m.get("url"), *json.loads(m.get("also_urls") or "[]")]}
     indexed_urls = {norm_url(u) for u in page_urls}
-    all_chunk_texts = [norm_text(d) for d in everything["documents"]]
+    section_idx = build_section_index(load_pages(RUN_DIR), cfg) if cfg["expand_section"] else None
+    if section_idx:
+        # group A = "quote not in any retrievable unit": with expansion the units are expanded sections
+        all_chunk_texts = [norm_text(expand_hit({"chunk_id": m["chunk_id"], "text": d}, section_idx, cfg)["text"])
+                           for d, m in zip(everything["documents"], everything["metadatas"])]
+    else:
+        all_chunk_texts = [norm_text(d) for d in everything["documents"]]
+    return col, page_urls, indexed_urls, all_chunk_texts, section_idx
 
-    items = load_eval_items()
+
+def retrieve_for_question(question, cfg, col, embed, reranker, section_idx):
+    """The full retrieval pipeline for one question: split → retrieve → rerank → fuse → expand.
+    Returns (ranked hits, queries run). Shared by eval and multihop."""
+    k = cfg["top_k_retrieve"]
+    # One query unless split_queries splits the question; then each query's list is fused.
+    queries = make_queries(question, cfg)
+    ranked_lists = []
+    for q in queries:
+        hits = retrieve(col, embed, cfg["query_prefix"] + q, k)  # prefix: bge-style query instruction
+        if reranker:
+            hits = rerank(reranker, q, hits)
+        ranked_lists.append(hits)
+    if len(queries) == 1:
+        hits = ranked_lists[0]
+    else:
+        fuse = {"rrf": rrf_fuse, "round_robin": round_robin_fuse}[cfg["fusion"]]
+        hits = fuse(ranked_lists, k)
+    if section_idx:
+        hits = expand_and_collapse(hits, section_idx, cfg)
+    return hits, queries
+
+
+def cmd_eval(args):
+    name, cfg = load_config(args.config)
+    col, page_urls, indexed_urls, all_chunk_texts, section_idx = open_eval_collection(name, cfg, args.config)
+
+    eval_file = Path(args.eval_file).resolve()
+    items = load_eval_items(eval_file)
     missing_pages = coverage_check(items, indexed_urls, len(page_urls))
 
     embed = make_embedder(cfg["embedding_model"])
     reranker = make_reranker(cfg["reranker"]) if cfg["reranker"] else None
-    k = cfg["top_k_retrieve"]
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     RESULTS_DIR.mkdir(exist_ok=True)
     out_path = RESULTS_DIR / f"{run_id}.jsonl"
@@ -310,11 +490,13 @@ def cmd_eval(args):
             row = {"run_id": run_id, "item_id": item["id"], "category": item.get("category"),
                    "question": item["question"]}
             try:
-                hits = retrieve(col, embed, cfg["query_prefix"] + item["question"], k)  # prefix: bge-style query instruction
-                if reranker:
-                    hits = rerank(reranker, item["question"], hits)
+                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx)
+                if len(queries) > 1:
+                    row["sub_queries"] = queries
                 row.update(score(item, hits, indexed_urls, all_chunk_texts))
-                keys = ("rank", "retrieval_rank", "url", "chunk_id", "score", "rerank_score")
+                row["ctx_words5"] = sum(len(h["text"].split()) for h in hits[:5])  # text the LLM would get in 5 slots
+                keys = ("rank", "chunk_rank", "retrieval_rank", "url", "chunk_id", "unit", "expanded_words",
+                        "score", "rerank_score", "rrf_score")
                 row["top5"] = [{**{key: h[key] for key in keys if key in h}, "text": h["text"][:300]} for h in hits[:5]]
             except Exception as e:
                 row.update(quote_ranks=None, rank=None, miss_group=None,
@@ -334,12 +516,16 @@ def cmd_eval(args):
         "config": cfg,
         "what_changed": args.change,
         "config_diff": config_diff(prev[-1]["config"] if prev else None, cfg),
+        "eval_file": str(eval_file.relative_to(ROOT)) if eval_file.is_relative_to(ROOT) else str(eval_file),
+        "eval_set_hash": eval_set_fingerprint(items),
+        "eval_set_n": len(items),
         "num_questions": len(rows),
         "num_errors": sum(bool(r.get("error")) for r in rows),
         "missing_pages": missing_pages, 
         **metrics(rows),
         **{f"miss_{g}": sum(r["miss_group"] == g for r in rows) for g in ("0", "A", "B", "C")},
         "per_category": {c: metrics(rs) for c, rs in sorted(by_cat.items())},
+        "ctx_words5": ctx_words5(rows),
         "results_file": str(out_path.relative_to(ROOT)),
     }
     with open(RUNS_FILE, "a", encoding="utf-8") as f:
@@ -381,17 +567,22 @@ def print_table(table, wrap=None):
 
 
 def print_runs_table(runs):
-    best, best_idx = -1, None
+    labels = eval_set_labels(read_runs())  # labels from the full history, so they don't shift when filtering
+    label = lambda r: labels.get(r.get("eval_set_hash"), "v?")
+    best = {}  # best Hit@5 per eval set version: scores on different question sets aren't comparable
     for i, r in enumerate(runs):
-        if r["hit5"] is not None and r["hit5"] > best:
-            best, best_idx = r["hit5"], i
+        v = label(r)
+        if r["hit5"] is not None and (v not in best or r["hit5"] > runs[best[v]]["hit5"]):
+            best[v] = i
     table = [["run", "what changed", "Hit@5", "Hit@50", "MRR", "0/A/B/C"]]
     for i, r in enumerate(runs):
-        mark = ("!" if r["missing_pages"] else "") + (" *" if i == best_idx else "")
-        table.append([r["run_id"] + mark, r["what_changed"] or "",
+        if i and label(r) != label(runs[i - 1]):
+            table.append([f"── eval set {label(r)} ──", f"{r.get('eval_set_n', r['num_questions'])} questions", "", "", "", ""])
+        mark = ("!" if r["missing_pages"] else "") + (" *" if best.get(label(r)) == i else "")
+        table.append([f"{r['run_id']} [{label(r)}]{mark}", r["what_changed"] or "",
                       r["hit5"], r["hit50"], r["mrr"], f"{r['miss_0']}/{r['miss_A']}/{r['miss_B']}/{r['miss_C']}"])
     print_table(table, wrap={1: 30})
-    print("* = best Hit@5 so far   ! = run had gold pages missing from the index")
+    print("[vN] = eval set version   * = best Hit@5 within that version   ! = run had gold pages missing from the index")
 
 
 def cmd_table(args):
@@ -436,22 +627,31 @@ def cmd_compare(args):
         path = ROOT / runs[run_id]["results_file"] if run_id in runs else RESULTS_DIR / f"{run_id}.jsonl"
         return {r["item_id"]: r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines()) if r}
 
-    print(f"\nCOMPARE {args.run_1} -> {args.run_2}")
-    if args.run_1 in runs and args.run_2 in runs:
-        r1, r2 = runs[args.run_1], runs[args.run_2]
-        groups = lambda r: f"{r['miss_0']}/{r['miss_A']}/{r['miss_B']}/{r['miss_C']}"
-        table = [["metric", args.run_1, args.run_2, "change"]]
-        for label, key in (("Hit@5", "hit5"), ("Hit@50", "hit50"), ("MRR", "mrr")):
-            delta = "" if r1[key] is None or r2[key] is None else f"{r2[key] - r1[key]:+.4f}"
-            table.append([label, r1[key], r2[key], delta])
-        table.append(["0/A/B/C", groups(r1), groups(r2), ""])
-        table.append(["what changed", "", r2["what_changed"] or "", ""])
-        print_table(table)
-
     a, b = load(args.run_1), load(args.run_2)
+    shared = sorted(set(a) & set(b))
+    labels = eval_set_labels(all_runs)
+    v1, v2 = (labels.get(runs.get(r, {}).get("eval_set_hash"), "v?") for r in (args.run_1, args.run_2))
+    print(f"\nCOMPARE {args.run_1} [{v1}] -> {args.run_2} [{v2}]")
+    if v1 != v2 or set(a) != set(b):
+        print(f"  Different eval set versions: metrics below are recomputed on the {len(shared)} shared questions "
+              f"({len(set(a) - set(b))} only in run 1, {len(set(b) - set(a))} only in run 2).")
+    # Metrics from the per-question rows of the shared questions, so both sides are on the same questions.
+    m1, m2 = metrics([a[i] for i in shared]), metrics([b[i] for i in shared])
+    groups = lambda res: "/".join(str(sum(res[i]["miss_group"] == g for i in shared)) for g in ("0", "A", "B", "C"))
+    table = [["metric", args.run_1, args.run_2, "change"]]
+    for label, key in (("Hit@5", "hit5"), ("Hit@50", "hit50"), ("MRR", "mrr")):
+        delta = "" if m1[key] is None or m2[key] is None else f"{m2[key] - m1[key]:+.4f}"
+        table.append([label, m1[key], m2[key], delta])
+    table.append(["0/A/B/C", groups(a), groups(b), ""])
+    c1, c2 = ctx_words5([a[i] for i in shared]), ctx_words5([b[i] for i in shared])
+    table.append(["ctx words (top 5)", c1 or "n/a", c2 or "n/a", f"{c2 - c1:+d}" if c1 and c2 else ""])
+    if args.run_2 in runs:
+        table.append(["what changed", "", runs[args.run_2]["what_changed"] or "", ""])
+    print_table(table)
+
     key = lambda r: float("inf") if r["rank"] is None else r["rank"]
     better, worse = [], []
-    for item_id in sorted(set(a) & set(b)):
+    for item_id in shared:
         ra, rb = a[item_id], b[item_id]
         show = lambda rank: "-" if rank is None else rank
         line = [item_id, ra["category"], show(ra["rank"]), show(rb["rank"]), ra["miss_group"] or "hit", rb["miss_group"] or "hit"]
@@ -463,7 +663,247 @@ def cmd_compare(args):
     for title, lines in (("IMPROVED", better), ("WORSE", worse)):
         print(f"\n{title} ({len(lines)})")
         print_table([header] + lines) if lines else print("  none")
-    print(f"\nunchanged: {len(set(a) & set(b)) - len(better) - len(worse)}")
+    print(f"\nunchanged: {len(shared) - len(better) - len(worse)}")
+
+
+# ---------- multi-hop eval ----------
+# Separate from the general eval: own items (eval_set multi-hop + validated drafts), passage-level metrics and
+# own output folder. Reuses the general pipeline (open_eval_collection, retrieve_for_question) and matching.
+MULTIHOP_DIR = ROOT / "multihop_eval"
+MULTIHOP_RUNS = MULTIHOP_DIR / "runs.jsonl"
+MULTIHOP_RESULTS = MULTIHOP_DIR / "results"
+DRAFT_MULTIHOP_FILE = ROOT / "data/eval_set/draft_multihop_v0.jsonl"
+
+
+def validate_drafts(draft_lines, eval_items, indexed_urls, pages):
+    """One report dict per draft line: status pass / fail / duplicate, reasons, flags. Never edits the drafts."""
+    by_hash = {p["content_hash"]: p["text"] for p in pages if p.get("content_hash")}
+    by_url = {p["url"].strip(): p["text"] for p in pages}
+    eval_by_id = {i["id"]: i for i in eval_items}
+    report = []
+    for n, line in enumerate(draft_lines, 1):
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError as e:
+            report.append({"id": f"<line {n}>", "status": "fail", "reasons": [f"invalid JSON: {e}"], "flags": [], "n_passages": 0})
+            continue
+        golds = d.get("gold_passages")
+        entry = {"id": d.get("id"), "status": "pass", "reasons": [], "flags": [],
+                 "n_passages": len(golds) if isinstance(golds, list) else 0}
+        if d.get("id") in eval_by_id:
+            entry["status"] = "duplicate"
+            entry["reasons"].append("same id as an eval_set item; the eval_set version is used")
+            if d.get("gold_passages") != eval_by_id[d["id"]]["gold_passages"]:
+                entry["reasons"].append("gold passages differ from the eval_set version")
+            report.append(entry)
+            continue
+        if not isinstance(d.get("id"), str) or not d["id"].strip():
+            entry["reasons"].append("missing id")
+        if not isinstance(d.get("question"), str) or not d["question"].strip():
+            entry["reasons"].append("missing question")
+        if not isinstance(golds, list) or not golds:
+            entry["reasons"].append("missing gold_passages")
+            golds = []
+        for j, g in enumerate(golds, 1):
+            if not isinstance(g, dict) or not (g.get("url") or "").strip() or not (g.get("quote") or "").strip():
+                entry["reasons"].append(f"passage {j}: missing url or quote")
+                continue
+            text = by_hash.get(g.get("content_hash")) or by_url.get(g["url"].strip())
+            if text is None:
+                entry["reasons"].append(f"passage {j}: no page snapshot for content_hash/url {g['url']}")
+            else:
+                page = norm_text(text)
+                missing = [f.strip() for f in quote_fragments(g["quote"]) if f not in page]
+                if missing:
+                    entry["reasons"].append(f"passage {j}: quote not in page snapshot (first missing piece: '{missing[0][:80]}')")
+            if norm_url(g["url"]) not in indexed_urls:
+                entry["reasons"].append(f"passage {j}: URL not in the collection: {g['url']}")
+        if len(golds) < 2:
+            entry["flags"].append(f"only {len(golds)} gold passage(s)")
+        entry["status"] = "fail" if entry["reasons"] else "pass"
+        report.append(entry)
+    return report
+
+
+def passage_miss_group(gold, rank, indexed_urls, all_chunk_texts):
+    """Miss group of one gold passage, same rules as score(): None if in the top 5, else 0 / A / B / C."""
+    if rank is not None and rank <= 5:
+        return None
+    if norm_url(gold["url"]) not in indexed_urls:
+        return "0"
+    if first_rank(quote_fragments(gold["quote"]), all_chunk_texts) is None:
+        return "A"
+    if rank is None or rank > 50:
+        return "C"
+    return "B"
+
+
+def multihop_metrics(rows):
+    ok = [r for r in rows if not r.get("error")]
+    ranks = [rk for r in ok for rk in r["passage_ranks"]]
+    groups = [g for r in ok for g in r["miss_groups"]]
+    mean = lambda xs: round(sum(xs) / len(xs), 4) if xs else None
+    return {
+        "num_items": len(ok),
+        "joint_hit5": mean([r["joint_hit@5"] for r in ok]),
+        "joint_hit10": mean([r["joint_hit@10"] for r in ok]),
+        "passage_recall5": mean([r["passage_recall@5"] for r in ok]),
+        "passage_mrr": mean([1 / rk if rk else 0 for rk in ranks]),
+        **{f"miss_{g}": groups.count(g) for g in ("0", "A", "B", "C")},
+    }
+
+
+def read_multihop_runs():
+    if not MULTIHOP_RUNS.exists():
+        return []
+    return [json.loads(l) for l in MULTIHOP_RUNS.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def print_multihop_runs_table(runs):
+    labels = eval_set_labels(runs)
+    best = max(range(len(runs)), key=lambda i: (runs[i]["joint_hit5"] or -1, -i), default=None)
+    table = [["run_id", "what_changed", "config_diff", "joint@5", "joint@10", "recall@5", "0/A/B/C"]]
+    for i, r in enumerate(runs):
+        diff = ", ".join(f"{k}: {o}->{n}" for k, (o, n) in r["config_diff"].items()) or "-"
+        table.append([f"{r['run_id']} [{labels.get(r.get('eval_set_hash'), 'v?')}]" + (" *" if i == best else ""),
+                      r["what_changed"] or "", diff, r["joint_hit5"], r["joint_hit10"], r["passage_recall5"],
+                      f"{r['miss_0']}/{r['miss_A']}/{r['miss_B']}/{r['miss_C']}"])
+    print_table(table, wrap={1: 30, 2: 30})
+    print("* = best joint@5   [vN] = multi-hop item set version   0/A/B/C = missing passages (not in top 5) by group")
+
+
+def cmd_multihop(args):
+    name, cfg = load_config(args.config)
+    col, page_urls, indexed_urls, all_chunk_texts, section_idx = open_eval_collection(name, cfg, args.config)
+
+    eval_items = [i for i in load_eval_items(EVAL_FILE) if i.get("category") == "multi-hop"]
+    draft_lines = [l for l in DRAFT_MULTIHOP_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    report = validate_drafts(draft_lines, eval_items, indexed_urls, load_pages(RUN_DIR))
+    MULTIHOP_DIR.mkdir(exist_ok=True)
+    with open(MULTIHOP_DIR / "draft_validation.jsonl", "w", encoding="utf-8") as f:
+        for entry in report:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    counts = {s: sum(e["status"] == s for e in report) for s in ("pass", "fail", "duplicate")}
+    print(f"\nDRAFT VALIDATION ({DRAFT_MULTIHOP_FILE.name}, {len(report)} drafts): "
+          f"{counts['pass']} pass, {counts['fail']} fail, {counts['duplicate']} duplicate of eval_set")
+    problems = [[e["id"], e["status"], "; ".join(e["reasons"])] for e in report if e["status"] != "pass"]
+    if problems:
+        print_table([["draft", "status", "reasons"]] + problems, wrap={2: 90})
+    flagged = [(i["id"], f"only {len(i['gold_passages'])} gold passage(s)") for i in eval_items if len(i["gold_passages"]) < 2]
+    flagged += [(e["id"], "; ".join(e["flags"])) for e in report if e["flags"] and e["status"] == "pass"]
+    for item_id, flag in flagged:
+        print(f"  FLAG {item_id}: {flag}")
+    print("  report written to", (MULTIHOP_DIR / "draft_validation.jsonl").relative_to(ROOT))
+    if args.validate_only:
+        return
+
+    passed = {e["id"] for e in report if e["status"] == "pass"}
+    drafts = [d for d in map(json.loads, draft_lines) if d.get("id") in passed]
+    items = [(i, "eval_set") for i in eval_items] + [(d, "draft_v0") for d in drafts]
+
+    embed = make_embedder(cfg["embedding_model"])
+    reranker = make_reranker(cfg["reranker"]) if cfg["reranker"] else None
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    MULTIHOP_RESULTS.mkdir(parents=True, exist_ok=True)
+    out_path = MULTIHOP_RESULTS / f"{run_id}.jsonl"
+    rows = []
+    with open(out_path, "w", encoding="utf-8") as f:
+        for item, source in items:
+            row = {"run_id": run_id, "item_id": item["id"], "source": source, "question": item["question"]}
+            try:
+                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx)
+                if len(queries) > 1:
+                    row["sub_queries"] = queries
+                hit_texts = [norm_text(h["text"]) for h in hits]  # hits are in rank order, so position == rank
+                ranks = [first_rank(quote_fragments(g["quote"]), hit_texts) for g in item["gold_passages"]]
+                row.update({
+                    "passage_ranks": ranks,
+                    "joint_hit@5": all(rk is not None and rk <= 5 for rk in ranks),
+                    "joint_hit@10": all(rk is not None and rk <= 10 for rk in ranks),
+                    "passage_recall@5": round(sum(rk is not None and rk <= 5 for rk in ranks) / len(ranks), 4),
+                    "miss_groups": [passage_miss_group(g, rk, indexed_urls, all_chunk_texts)
+                                    for g, rk in zip(item["gold_passages"], ranks)],
+                    "top10": [{**{key: h[key] for key in ("rank", "url", "chunk_id", "score") if key in h},
+                               "text": h["text"][:300]} for h in hits[:10]],
+                })
+            except Exception as e:
+                row.update(error=f"{type(e).__name__}: {e}", trace=traceback.format_exc(limit=3))
+                print(f"  ERROR {item['id']}: {row['error']}")
+            rows.append(row)
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    by_source = defaultdict(list)
+    for r in rows:
+        by_source[r["source"]].append(r)
+    prev = read_multihop_runs()
+    run = {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "collection": name,
+        "config": cfg,
+        "what_changed": args.change,
+        "config_diff": config_diff(prev[-1]["config"] if prev else None, cfg),
+        "eval_set_hash": eval_set_fingerprint([i for i, _ in items]),  # version of the multi-hop item set
+        "num_items": {s: len(rs) for s, rs in by_source.items()},
+        "num_drafts_rejected": counts["fail"],
+        "num_errors": sum(bool(r.get("error")) for r in rows),
+        **multihop_metrics(rows),
+        "by_source": {s: multihop_metrics(rs) for s, rs in sorted(by_source.items())},
+        "results_file": str(out_path.relative_to(ROOT)),
+    }
+    with open(MULTIHOP_RUNS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(run, ensure_ascii=False) + "\n")
+
+    print(f"\nMULTI-HOP RUN {run_id}  collection={name}  items={run['num_items']}  errors={run['num_errors']}")
+    table = [["source", "items", "joint@5", "joint@10", "recall@5", "passage MRR", "missing 0/A/B/C"]]
+    for label, m in [*run["by_source"].items(), ("ALL", multihop_metrics(rows))]:
+        table.append([label, m["num_items"], m["joint_hit5"], m["joint_hit10"], m["passage_recall5"], m["passage_mrr"],
+                      f"{m['miss_0']}/{m['miss_A']}/{m['miss_B']}/{m['miss_C']}"])
+    print_table(table)
+    print("\nALL MULTI-HOP RUNS")
+    print_multihop_runs_table(read_multihop_runs())
+
+
+def cmd_multihop_compare(args):
+    runs = {r["run_id"]: r for r in read_multihop_runs()}
+    for rid in (args.run_1, args.run_2):
+        if rid not in runs:
+            sys.exit(f"Unknown multi-hop run {rid!r}")
+    load = lambda rid: {r["item_id"]: r for r in map(json.loads, (ROOT / runs[rid]["results_file"]).read_text(encoding="utf-8").splitlines())}
+    a, b = load(args.run_1), load(args.run_2)
+    shared = sorted(set(a) & set(b))
+    print(f"\nMULTI-HOP COMPARE {args.run_1} -> {args.run_2}")
+    if set(a) != set(b):
+        print(f"  Different item sets: metrics below are on the {len(shared)} shared items "
+              f"({len(set(a) - set(b))} only in run 1, {len(set(b) - set(a))} only in run 2).")
+    m1, m2 = multihop_metrics([a[i] for i in shared]), multihop_metrics([b[i] for i in shared])
+    table = [["metric", args.run_1, args.run_2, "change"]]
+    for label, key in (("joint@5", "joint_hit5"), ("joint@10", "joint_hit10"), ("recall@5", "passage_recall5"),
+                       ("passage MRR", "passage_mrr")):
+        delta = "" if m1[key] is None or m2[key] is None else f"{m2[key] - m1[key]:+.4f}"
+        table.append([label, m1[key], m2[key], delta])
+    groups = lambda m: f"{m['miss_0']}/{m['miss_A']}/{m['miss_B']}/{m['miss_C']}"
+    table.append(["missing 0/A/B/C", groups(m1), groups(m2), ""])
+    table.append(["what changed", "", runs[args.run_2]["what_changed"] or "", ""])
+    print_table(table)
+
+    # an item improves if its worst passage rank improves (None = not retrieved = worst)
+    worst = lambda r: float("inf") if r.get("error") or None in r["passage_ranks"] else max(r["passage_ranks"])
+    show = lambda r: "error" if r.get("error") else "[" + ", ".join("-" if x is None else str(x) for x in r["passage_ranks"]) + "]"
+    hit = lambda r: "joint@5" if r.get("joint_hit@5") else ("joint@10" if r.get("joint_hit@10") else "miss")
+    better, worse = [], []
+    for i in shared:
+        line = [i, a[i]["source"], show(a[i]), show(b[i]), hit(a[i]), hit(b[i])]
+        if worst(b[i]) < worst(a[i]):
+            better.append(line)
+        elif worst(b[i]) > worst(a[i]):
+            worse.append(line)
+    header = ["item", "source", f"passage ranks {args.run_1}", f"passage ranks {args.run_2}", "before", "after"]
+    for title, lines in (("IMPROVED", better), ("WORSE", worse)):
+        print(f"\n{title} ({len(lines)})")
+        print_table([header] + lines) if lines else print("  none")
+    print(f"\nunchanged: {len(shared) - len(better) - len(worse)}")
 
 
 def main():
@@ -477,13 +917,22 @@ def main():
     p = sub.add_parser("eval")
     p.add_argument("--config", required=True)
     p.add_argument("--change", required=True, help="what you changed since the last run")
+    p.add_argument("--eval-file", default=str(EVAL_FILE), help="eval set to score (default: %(default)s)")
     p = sub.add_parser("compare")
     p.add_argument("run_1", nargs="?", help="default: previous run")
     p.add_argument("run_2", nargs="?", help="default: latest run")
     p = sub.add_parser("table", help="per-question ranks side by side")
     p.add_argument("run_ids", nargs="*", help="runs to show (default: all)")
+    p = sub.add_parser("multihop", help="multi-hop eval (eval_set multi-hop items + validated drafts)")
+    p.add_argument("--config", required=True)
+    p.add_argument("--change", required=True, help="what you changed since the last multi-hop run")
+    p.add_argument("--validate-only", action="store_true", help="only validate the draft items and write the report")
+    p = sub.add_parser("multihop-compare", help="items that improved / got worse between two multi-hop runs")
+    p.add_argument("run_1")
+    p.add_argument("run_2")
     args = ap.parse_args()
-    {"index": cmd_index, "eval": cmd_eval, "compare": cmd_compare, "table": cmd_table}[args.cmd](args)
+    {"index": cmd_index, "eval": cmd_eval, "compare": cmd_compare, "table": cmd_table,
+     "multihop": cmd_multihop, "multihop-compare": cmd_multihop_compare}[args.cmd](args)
 
 
 if __name__ == "__main__":

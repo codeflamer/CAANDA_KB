@@ -118,6 +118,21 @@ must be retrieved for the question to count as a hit (question rank = worst quot
   its `content_hash` points to the right page.)
 - After a re-crawl, re-check every quote whose page's `content_hash` changed.
 
+## After changing the eval set: re-run the reference configs
+
+Every `retrieval_eval.py eval` run records a fingerprint of the questions it scored (`eval_set_hash`:
+ids, questions and gold passages). Adding, removing or editing an item, including fixing one quote,
+creates a new version, shown as `[v1]`, `[v2]`, ... next to each run in the runs table. Hit@5 from
+different versions is computed on different questions and is **not** comparable:
+
+- the runs table marks where the version changes and stars the best Hit@5 *within* each version;
+- `compare` on two runs from different versions recomputes the metrics on their shared questions only and says so.
+
+So after changing `eval_set.jsonl`, first re-run the reference configs on the new version (no LLM, embeddings
+are cached, about a minute each), for example the MiniLM dedup baseline and the current best config, with
+`--change "re-run <config> on eval set vN"`. New experiments then have a same-version row to compare against.
+To try a candidate eval set without touching the real file: `eval --config ... --eval-file <path>`.
+
 ## Check your quotes
 
 Run from the repo root after adding or editing items; it prints any quote that is not found in its page:

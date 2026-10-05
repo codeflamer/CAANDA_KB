@@ -1,0 +1,22 @@
+{"id": "mh-001", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
+{"id": "mh-002", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
+{"id": "mh-003", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used", "gold passages differ from the eval_set version"], "flags": [], "n_passages": 2}
+{"id": "mh-004", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
+{"id": "mh-005", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
+{"id": "mh-006", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-007", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-008", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-009", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-010", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-011", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-012", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-013", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-014", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-015", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-016", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-017", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-018", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-019", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-020", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-021", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-022", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
