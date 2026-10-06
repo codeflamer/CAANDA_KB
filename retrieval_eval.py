@@ -354,7 +354,7 @@ def expand_hit(hit, idx, cfg):
         lo, hi = 0, len(words)
     else:
         end = min(e["start"] + cfg["chunk_size"], len(words))
-        lo = max(0, e["start"] - (cap - (end - e["start"])) // 2)
+        lo = max(0, e["start"] - (cap - (end - e["start"])) // 2) 
         hi = min(len(words), lo + cap)
         lo = max(0, hi - cap)
     body = " ".join(words[lo:hi])
