@@ -40,7 +40,8 @@ from add_to_vdb import chunk_page, split_sections  # noqa: E402
 DEFAULTS = {"chunking_method": "section_words", "add_heading_path": True, "top_k_retrieve": 50, "reranker": None,
             "dedupe_chunks": False, "query_prefix": "",
             "split_queries": False, "fusion": "rrf", "subquery_filter": False,
-            "expand_section": False, "expand_max_words": 450}
+            "expand_section": False, "expand_max_words": 450,
+            "search": "hnsw"}
 # Settings baked into a collection at index time; eval refuses a config that disagrees with the collection.
 INDEX_SETTINGS = ("embedding_model", "chunking_method", "chunk_size", "chunk_overlap", "add_heading_path", "dedupe_chunks")
 
@@ -233,8 +234,29 @@ def coverage_check(items, indexed_urls, n_pages):
 
 
 # ---------- eval ----------
+class ExactSearch:
+    """Exact cosine search over a collection's stored embeddings (`search: exact`). Chroma's HNSW search
+    returns only ~94-97 of the true top 100, and a different set per process. Same query()/result shape as
+    Chroma's, so retrieve() works with either. Ties are broken by chunk id, so the order is always the same."""
+
+    def __init__(self, ids, documents, metadatas, embeddings):
+        order = np.argsort(np.asarray(ids))  # rows in chunk-id order -> stable sort below breaks ties by id
+        self.ids = [ids[i] for i in order]
+        self.documents = [documents[i] for i in order]
+        self.metadatas = [metadatas[i] for i in order]
+        m = np.asarray(embeddings, dtype=np.float32)[order]
+        self.matrix = m / np.linalg.norm(m, axis=1, keepdims=True)
+
+    def query(self, query_embeddings, n_results, include=None):
+        q = np.asarray(query_embeddings[0], dtype=np.float32)
+        sims = self.matrix @ (q / np.linalg.norm(q))
+        top = np.argsort(-sims, kind="stable")[:n_results]
+        return {"ids": [[self.ids[i] for i in top]], "documents": [[self.documents[i] for i in top]],
+                "metadatas": [[self.metadatas[i] for i in top]], "distances": [[float(1 - sims[i]) for i in top]]}
+
+
 def retrieve(col, embed, question, k):
-    """Top-k chunks in the order Chroma returns them."""
+    """Top-k chunks in the order the search returns them (Chroma HNSW, or ExactSearch)."""
     r = col.query(query_embeddings=[embed([question])[0].tolist()], n_results=k,
                   include=["documents", "metadatas", "distances"])
     return [{"rank": i, "url": norm_url(m.get("url")), "chunk_id": m.get("chunk_id", id_),
@@ -424,7 +446,8 @@ def config_diff(old, new):
 
 def open_eval_collection(name, cfg, config_path):
     """Open the collection, check it was built with the config's index settings, and collect what scoring needs.
-    Returns (col, page_urls, indexed_urls, all_chunk_texts, section_idx). Shared by eval and multihop."""
+    Returns (col, page_urls, indexed_urls, all_chunk_texts, section_idx). Shared by eval and multihop.
+    With `search: exact`, col is an ExactSearch over the collection's stored embeddings."""
     client = chromadb.PersistentClient(path=str(CHROMA_PATH))
     try:
         col = client.get_collection(name, embedding_function=None)
@@ -435,7 +458,10 @@ def open_eval_collection(name, cfg, config_path):
     if mismatch:
         sys.exit(f"Collection {name!r} was built with different settings {{setting: [collection, config]}}: {mismatch}")
 
-    everything = col.get(include=["documents", "metadatas"])
+    exact = cfg["search"] == "exact"
+    if cfg["search"] not in ("hnsw", "exact"):
+        sys.exit(f"search must be 'hnsw' or 'exact', got {cfg['search']!r}")
+    everything = col.get(include=["documents", "metadatas", *(["embeddings"] if exact else [])])
     # a deduplicated chunk also stands for the pages listed in also_urls
     page_urls = {u for m in everything["metadatas"] for u in [m.get("url"), *json.loads(m.get("also_urls") or "[]")]}
     indexed_urls = {norm_url(u) for u in page_urls}
@@ -446,6 +472,8 @@ def open_eval_collection(name, cfg, config_path):
                            for d, m in zip(everything["documents"], everything["metadatas"])]
     else:
         all_chunk_texts = [norm_text(d) for d in everything["documents"]]
+    if exact:
+        col = ExactSearch(everything["ids"], everything["documents"], everything["metadatas"], everything["embeddings"])
     return col, page_urls, indexed_urls, all_chunk_texts, section_idx
 
 
