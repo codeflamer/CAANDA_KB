@@ -1,8 +1,8 @@
-{"id": "mh-001", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
-{"id": "mh-002", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
-{"id": "mh-003", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used", "gold passages differ from the eval_set version"], "flags": [], "n_passages": 2}
-{"id": "mh-004", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
-{"id": "mh-005", "status": "duplicate", "reasons": ["same id as an eval_set item; the eval_set version is used"], "flags": [], "n_passages": 2}
+{"id": "mh-001", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-002", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-003", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-004", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
+{"id": "mh-005", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
 {"id": "mh-006", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
 {"id": "mh-007", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}
 {"id": "mh-008", "status": "pass", "reasons": [], "flags": [], "n_passages": 2}

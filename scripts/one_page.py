@@ -112,3 +112,12 @@ print(quote in norm(chunks[0].get("text")))
 
 quote_ranks =  next((c["rank"] for c in chunks if quote in c["text"]),None)
 print(quote_ranks)
+
+
+import json
+
+with open("../multihop_eval/results/20261011-144938.jsonl", "r", encoding="utf-8") as f:
+    gold_standard = [json.loads(line) for line in f if line.strip()]
+
+question1 = gold_standard[2]["question"]
+subqueries = [subquery for subquery in gold_standard[2]["sub_queries"]]

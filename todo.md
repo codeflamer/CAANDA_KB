@@ -8,7 +8,7 @@
     - Ranked too low : try more lower ranks(done, solved with dedup + a better embedding model + expandid context)
     - Not found at all: - explore solutions like hybrid search, context heading, o rtry different embedding models.
     ## Today
-    - The multihop siuuatin, where w can find one part of tehr reference and the other doe s not xist
+    - The multihop siuuatin, where w can find one part of tehr reference and the other does not xist
 
 , o rte otehr exist but ranked too low.. resllt, i want them both to rank higher.
 

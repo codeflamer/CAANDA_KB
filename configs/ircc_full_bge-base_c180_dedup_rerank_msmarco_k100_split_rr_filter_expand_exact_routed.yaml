@@ -1,0 +1,20 @@
+# Best config (ircc_full_bge-base_c180_dedup_rerank_msmarco_k100_split_rr_filter_expand_exact) + LLM category router: questions classified as multi-hop get chain retrieval (chain_hops: 2), all others use the base pipeline. Chosen from run 20261011-163216 (chain helps multi-hop only).
+collection: ircc_full_bge-base_c180_dedup
+embedding_model: BAAI/bge-base-en-v1.5
+query_prefix: "Represent this sentence for searching relevant passages: "
+chunking_method: section_words
+chunk_size: 180
+chunk_overlap: 30
+add_heading_path: true
+dedupe_chunks: true
+top_k_retrieve: 100
+reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+split_queries: true
+fusion: round_robin
+subquery_filter: true
+expand_section: true
+expand_max_words: 450
+search: exact
+chain_hops: 2
+route: llm
+chain_categories: [multi-hop]

@@ -7,6 +7,7 @@ Usage (from repo root):
     .venv/Scripts/python retrieval_eval.py table   [run_id ...]
     .venv/Scripts/python retrieval_eval.py multihop --config configs/<name>.yaml --change "what I changed" [--validate-only]
     .venv/Scripts/python retrieval_eval.py multihop-compare <run_id_1> <run_id_2>
+    .venv/Scripts/python retrieval_eval.py multihop-rescore [run_id ...]   (add new metrics to past multi-hop runs)
 """
 import argparse
 import hashlib
@@ -30,6 +31,7 @@ RUN_DIR = ROOT / "data/raw/2026-09-20"
 EVAL_FILE = ROOT / "data/eval_set/eval_set.jsonl"
 CHROMA_PATH = ROOT / "indexes/retrieval_eval"
 EMBED_CACHE = ROOT / "cache/embeddings.sqlite"
+LLM_CACHE = ROOT / "cache/llm_cache.jsonl"
 RESULTS_DIR = ROOT / "retrieval_results"
 RUNS_FILE = ROOT / "retrieval_runs.jsonl"
 
@@ -41,7 +43,12 @@ DEFAULTS = {"chunking_method": "section_words", "add_heading_path": True, "top_k
             "dedupe_chunks": False, "query_prefix": "",
             "split_queries": False, "fusion": "rrf", "subquery_filter": False,
             "expand_section": False, "expand_max_words": 450,
-            "search": "hnsw"}
+            "search": "hnsw",
+            "split_method": "rules", "chain_hops": 1, "chain_context_k": 3, "llm_model": "gpt-5-mini",
+            "decompose_prompt": "v1",
+            "rt_rag": False, "rt_trees": 5, "rt_max_leaves": 4, "rt_answer_k": 3, "rt_rewrites": 3,
+            "rt_answer_samples": 1,
+            "route": "none", "chain_categories": ["multi-hop"]}
 # Settings baked into a collection at index time; eval refuses a config that disagrees with the collection.
 INDEX_SETTINGS = ("embedding_model", "chunking_method", "chunk_size", "chunk_overlap", "add_heading_path", "dedupe_chunks")
 
@@ -277,6 +284,145 @@ def rerank(reranker, question, hits):
             for i, (h, s) in enumerate(order, 1)]
 
 
+# ---------- LLM query generation (split_method: llm, chain_hops: 2), cached ----------
+# Every response is cached in LLM_CACHE keyed by model + prompt name + version + input, so re-runs make no calls
+# and give the same queries. Bump a prompt's version when its text changes.
+LLM_STATS = {"calls": 0, "cache_hits": 0}
+
+
+class LLMError(RuntimeError):
+    """An LLM call failed; aborts the run (not counted as a per-item error)."""
+_llm = {"client": None, "cache": None}
+
+DECOMPOSE_V1 = ("decompose", "v1", """You turn a user's question about Canadian immigration (IRCC) into search
+queries for a retrieval system over IRCC web pages. If the question asks about several distinct things, write one
+query per thing (at most 4); otherwise write one query. Every query must be self-contained: repeat the context it
+needs from the rest of the question (who the person is, program type and length, permit status, school type, dates),
+and replace pronouns and vague references ("that", "both of us", "the new place") with what they refer to. Use the
+official terms where you know them (e.g. "post-graduation work permit (PGWP)", "provincial attestation letter (PAL)",
+"designated learning institution (DLI)"). Do not answer the question.
+Return JSON: {"queries": ["...", "..."]}""")
+
+# v2: v1 produced 50-80-word research briefs ("Include IRCC guidance on ...") that diluted the embedding and confused
+# the ms-marco reranker, and sometimes merged two topics into one query. v2 asks for short search-engine queries.
+DECOMPOSE_V2 = ("decompose", "v2", """You turn a user's question about Canadian immigration (IRCC) into short search
+queries for a search engine over IRCC web pages.
+Rules:
+- Write one query per distinct thing the user asks (at most 4). Never merge two asks into one query.
+- Each query is at most 20 words, phrased like a search-engine query or a short question.
+- Make each query understandable on its own: replace pronouns and vague references ("that", "both of us", "the new
+  place") with what they mean, and keep only the details from the question that change the answer (e.g. "5-month
+  program", "no study permit", "PhD", "public university", "permit expired").
+- Use official terms where you know them (post-graduation work permit, provincial attestation letter, designated
+  learning institution), but do not add topics the user did not ask about.
+- No lists of things to "include", no search operators (site:, quotes), no answers.
+Return JSON: {"queries": ["...", "..."]}""")
+DECOMPOSE_PROMPTS = {"v1": DECOMPOSE_V1, "v2": DECOMPOSE_V2}
+
+CHAIN_PROMPT = ("chain", "v1", """You help a retrieval system answer a user's question about Canadian immigration
+(IRCC). You get the question and the passages found so far. Decide what information the question needs that these
+passages do NOT already contain, and write 0 to 2 self-contained search queries for that missing information (carry
+the needed context from the question; use official IRCC terms where you know them). If the passages already cover
+everything, return no queries. Do not answer the question.
+Return JSON: {"missing": "<one sentence>", "queries": ["..."]}""")
+
+
+def llm_json(cfg, prompt, user, sample=0):
+    """JSON response for (system prompt, user text), from LLM_CACHE if present, else one API call (then cached).
+    sample > 0 gives an independent cached draw for the same input (RT-RAG's multiple candidate trees/answers)."""
+    name, version, system = prompt
+    parts = [cfg["llm_model"], name, version, user] + ([sample] if sample else [])  # sample 0 keeps the old keys
+    key = hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()
+    if _llm["cache"] is None:
+        _llm["cache"] = {}
+        if LLM_CACHE.exists():
+            for line in LLM_CACHE.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    e = json.loads(line)
+                    _llm["cache"][e["key"]] = e["response"]
+    if key in _llm["cache"]:
+        LLM_STATS["cache_hits"] += 1
+        return _llm["cache"][key]
+    if _llm["client"] is None:
+        from openai import OpenAI  # only needed when an LLM setting is used
+        _llm["client"] = OpenAI(max_retries=3)  # OPENAI_API_KEY from env (.env loaded by add_to_vdb)
+    try:
+        r = _llm["client"].chat.completions.create(
+            model=cfg["llm_model"], response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+        response = json.loads(r.choices[0].message.content)
+    except Exception as e:  # quota, auth, network, bad JSON: stop the run rather than score 22 errors
+        raise LLMError(f"{type(e).__name__}: {e}") from e
+    LLM_STATS["calls"] += 1
+    _llm["cache"][key] = response
+    LLM_CACHE.parent.mkdir(exist_ok=True)
+    with open(LLM_CACHE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "model": cfg["llm_model"], "prompt": f"{name}/{version}", "user": user,
+                            "response": response}, ensure_ascii=False) + "\n")
+    return response
+
+
+def clean_queries(response, limit):
+    qs = response.get("queries") if isinstance(response, dict) else None
+    return [q.strip() for q in (qs or []) if isinstance(q, str) and q.strip()][:limit]
+
+
+def llm_decompose(question, cfg):
+    """Self-contained sub-queries for the question (1–4); the question itself if the LLM returns none."""
+    prompt = DECOMPOSE_PROMPTS[cfg["decompose_prompt"]]
+    return clean_queries(llm_json(cfg, prompt, question), 4) or [question]
+
+
+ROUTE_PROMPT = ("route", "v1", """Classify a user's question about Canadian immigration (IRCC) by what answering it
+requires. Categories:
+- "single-fact": one fact from one passage.
+- "multi-hop": the answer needs facts from two or more different topics/pages (e.g. the user asks two linked things,
+  or their situation touches two separate rules); no single passage answers it.
+- "conditional": the answer depends on a condition (if X then Y, otherwise Z).
+- "temporal": about a rule that changed or may have changed over time ("is that still true", "since", "new rule").
+- "ambiguous": the question leaves out a detail that changes the answer (several possible interpretations).
+- "unanswerable": IRCC web pages would not contain the answer (personal case status, locations, opinions, other
+  countries' rules).
+Return JSON: {"category": "<one of the above>"}""")
+ROUTE_CATEGORIES = ("single-fact", "multi-hop", "conditional", "temporal", "ambiguous", "unanswerable")
+
+
+def llm_route(question, cfg):
+    """Predicted category of the question (from the question text only), or 'unknown'."""
+    c = llm_json(cfg, ROUTE_PROMPT, question).get("category")
+    return c if c in ROUTE_CATEGORIES else "unknown"
+
+
+def route_summary(rows, gold_category=None):
+    """Router accuracy vs the true category (row["category"], or gold_category for multi-hop items) and
+    predicted-category counts per true category. None if the run did not route."""
+    routed = [r for r in rows if r.get("route_category")]
+    if not routed:
+        return None
+    gold = lambda r: gold_category or r.get("category")
+    confusion = defaultdict(lambda: defaultdict(int))
+    for r in routed:
+        confusion[gold(r)][r["route_category"]] += 1
+    return {"route_accuracy": round(sum(r["route_category"] == gold(r) for r in routed) / len(routed), 4),
+            "routed_to_chain": sum(r.get("route_pipeline") == "chain" for r in routed),
+            "route_confusion": {g: dict(p) for g, p in sorted(confusion.items())}}
+
+
+def print_route_summary(rs):
+    if not rs:
+        return
+    print(f"ROUTER  accuracy={rs['route_accuracy']}  sent to chain={rs['routed_to_chain']}")
+    print_table([["true category", "predicted (count)"]] +
+                [[g, ", ".join(f"{p}: {n}" for p, n in sorted(ps.items()))] for g, ps in rs["route_confusion"].items()])
+
+
+def llm_follow_up(question, hits, cfg):
+    """(missing, 0–2 follow-up queries) for what the top chain_context_k hop-1 passages don't cover."""
+    passages = "\n\n".join(f"[{i}] {h['text']}" for i, h in enumerate(hits[:cfg["chain_context_k"]], 1))
+    response = llm_json(cfg, CHAIN_PROMPT, f"QUESTION:\n{question}\n\nPASSAGES FOUND SO FAR:\n{passages}")
+    return response.get("missing", ""), clean_queries(response, 2)
+
+
 # Split points: sentence ends, a spaced dash, or a comma that starts a new question clause
 # (", and am I ...", ", does that mean ...", ", can I ..."). Rule-based, no LLM, and blind to the category.
 SPLIT_RE = re.compile(
@@ -304,8 +450,11 @@ def is_vague(part, min_content_words=3):
 
 def make_queries(question, cfg):
     """Queries to run for one question; more than one means the question was split.
+    split_method llm: the LLM's self-contained sub-queries (subquery_filter not applied).
     Without subquery_filter: full question + every piece. With it: only the non-vague pieces
     (the full question would count the first piece twice); back to the full question if < 2 pieces survive."""
+    if cfg["split_method"] == "llm":
+        return llm_decompose(question, cfg)
     pieces = split_question(question) if cfg["split_queries"] else []
     if not pieces:
         return [question]
@@ -477,9 +626,170 @@ def open_eval_collection(name, cfg, config_path):
     return col, page_urls, indexed_urls, all_chunk_texts, section_idx
 
 
-def retrieve_for_question(question, cfg, col, embed, reranker, section_idx):
-    """The full retrieval pipeline for one question: split → retrieve → rerank → fuse → expand.
-    Returns (ranked hits, queries run). Shared by eval and multihop."""
+def chain_hop(question, hits, cfg, col, embed, reranker, section_idx):
+    """Hop 2: follow-up queries from the top hop-1 passages (as the LLM would see them, i.e. expanded if
+    expansion is on); each is retrieved + reranked, then round-robin fused after the hop-1 list, so hop 1's #1 stays
+    #1. Returns (hits, missing, follow-up queries); no follow-up queries → hop-1 list unchanged."""
+    k = cfg["top_k_retrieve"]
+    context = expand_and_collapse(hits[:cfg["chain_context_k"] * 3], section_idx, cfg) if section_idx else hits
+    missing, follow_ups = llm_follow_up(question, context, cfg)
+    lists = [hits]
+    for q in follow_ups:
+        h2 = retrieve(col, embed, cfg["query_prefix"] + q, k)
+        lists.append(rerank(reranker, q, h2) if reranker else h2)
+    return (round_robin_fuse(lists, k) if follow_ups else hits), missing, follow_ups
+
+
+# ---------- RT-RAG (Reasoning in Trees, arXiv 2601.11255), adapted for retrieval-only eval ----------
+# 1. Entity analysis + reasoning tree (core query, known / unknown entities; parallel / sequential / direct
+#    decomposition, depth <= 2). rt_trees candidate trees are sampled; consensus = the most frequent
+#    (depth, node count) shape, first tree of that shape wins.
+# 2. Bottom-up (post-order) traversal. Leaf: retrieve + rerank, LLM answers from the top rt_answer_k passages or says
+#    None → query rewritten (up to rt_rewrites times). Sequential children get earlier siblings' answers substituted
+#    for "[answer N]". A parent whose child stays unanswered becomes a leaf (adaptive leaf: retrieved directly);
+#    otherwise the LLM combines the child answers (no retrieval). rt_answer_samples answers per node, majority kept
+#    (rejection sampling; 1 = off).
+# 3. Ranked list for scoring = round-robin fusion of every retrieval list, in traversal order (leaves first).
+RT_TREE_PROMPT = ("rt_tree", "v1", """You plan how to research a user's question about Canadian immigration (IRCC)
+with a search engine over IRCC web pages. First analyse the question:
+- core_query: what the user ultimately wants to know (one sentence).
+- known_entities: facts the user states about their situation (program, length, permit status, school, dates, who).
+- unknown_entities: facts that must be looked up before the core query can be answered.
+Then build a reasoning tree. Each node has a "question" and optional "children"; a node with children also has a
+"pattern":
+- "parallel": the children are independent sub-questions whose answers together answer the node.
+- "sequential": a later child needs an earlier child's answer; refer to it as "[answer 1]", "[answer 2]" (1-based
+  position among its siblings).
+A node without children is a leaf and must be answerable by a single search. Use "direct" (no children) for the root
+if the question is already single-hop. Max depth 2 below the root, at most 4 leaves in total.
+Every node question must be self-contained: include the known entities that matter for it (e.g. "5-month program",
+"no study permit", "PhD at a public university"), no pronouns like "that" or "both of us". Keep questions short
+(at most 25 words). Do not answer anything.
+Return JSON: {"core_query": "...", "known_entities": ["..."], "unknown_entities": ["..."],
+"tree": {"question": "...", "pattern": "parallel|sequential|direct", "children": [{"question": "...", ...}]}}""")
+
+RT_ANSWER_PROMPT = ("rt_answer", "v1", """Answer the question using ONLY the passages from IRCC web pages below.
+Answer in at most 2 sentences. If the passages do not contain the information needed, answer exactly "None".
+Return JSON: {"answer": "..."}""")
+
+RT_REWRITE_PROMPT = ("rt_rewrite", "v1", """A search over IRCC (Canadian immigration) web pages did not find the answer
+to the search query below. Rewrite the query so it keeps the same meaning but uses different wording: synonyms, the
+official IRCC term, or a more general phrasing of the same need. At most 20 words, no search operators.
+Return JSON: {"query": "..."}""")
+
+RT_COMBINE_PROMPT = ("rt_combine", "v1", """Answer the question using ONLY the answers to its sub-questions below.
+Answer in at most 3 sentences. If they are not enough, answer exactly "None".
+Return JSON: {"answer": "..."}""")
+
+
+def rt_shape(node, depth=0):
+    """(depth, node count) of a tree."""
+    kids = node.get("children") or []
+    if not kids:
+        return depth, 1
+    shapes = [rt_shape(c, depth + 1) for c in kids]
+    return max(d for d, _ in shapes), 1 + sum(n for _, n in shapes)
+
+
+def rt_clean_tree(node, cfg, depth=0):
+    """Valid node dict or None; cuts below depth 2 and drops empty questions."""
+    if not isinstance(node, dict) or not isinstance(node.get("question"), str) or not node["question"].strip():
+        return None
+    kids = [c for c in (rt_clean_tree(c, cfg, depth + 1) for c in (node.get("children") or [])[:4]) if c] if depth < 2 else []
+    pattern = node.get("pattern") if node.get("pattern") in ("parallel", "sequential") and kids else "direct"
+    return {"question": node["question"].strip(), "pattern": pattern, "children": kids}
+
+
+def rt_count_leaves(node):
+    return 1 if not node["children"] else sum(rt_count_leaves(c) for c in node["children"])
+
+
+def rt_build_tree(question, cfg):
+    """Sample rt_trees trees, keep the first one with the most frequent shape. Falls back to a single-node tree."""
+    candidates = []
+    for i in range(cfg["rt_trees"]):
+        r = llm_json(cfg, RT_TREE_PROMPT, question, sample=i + 1)
+        tree = rt_clean_tree(r.get("tree") if isinstance(r, dict) else None, cfg)
+        if tree and rt_count_leaves(tree) <= cfg["rt_max_leaves"]:
+            candidates.append((r, tree))
+    if not candidates:
+        return {"question": question, "pattern": "direct", "children": []}, {}, []
+    shapes = [rt_shape(t) for _, t in candidates]
+    best = max(shapes, key=lambda s: (shapes.count(s), -shapes.index(s)))
+    r, tree = candidates[shapes.index(best)]
+    analysis = {k: r.get(k) for k in ("core_query", "known_entities", "unknown_entities")}
+    return tree, analysis, [list(s) for s in shapes]
+
+
+def rt_answer(cfg, prompt, user):
+    """Majority answer over rt_answer_samples draws (rejection sampling); None if the majority is 'None'."""
+    answers = []
+    for i in range(cfg["rt_answer_samples"]):
+        a = llm_json(cfg, prompt, user, sample=i)  # sample 0 = the plain cached call
+        a = (a.get("answer") if isinstance(a, dict) else None) or "None"
+        answers.append(a.strip())
+    norm = [a.lower().strip(" .") for a in answers]
+    top = max(norm, key=lambda a: (norm.count(a), -norm.index(a)))
+    return None if top == "none" else answers[norm.index(top)]
+
+
+def rt_rag_retrieve(question, cfg, col, embed, reranker, section_idx):
+    """RT-RAG traversal for one question. Returns (fused hits, queries searched, trace dict)."""
+    k = cfg["top_k_retrieve"]
+    lists, queries, log = [], [], []
+    tree, analysis, shapes = rt_build_tree(question, cfg)
+
+    def search(q):
+        hits = retrieve(col, embed, cfg["query_prefix"] + q, k)
+        hits = rerank(reranker, q, hits) if reranker else hits
+        lists.append(hits)
+        queries.append(q)
+        return hits
+
+    def answer_leaf(q):
+        for attempt in range(cfg["rt_rewrites"] + 1):
+            hits = search(q)
+            context = expand_and_collapse(hits[:cfg["rt_answer_k"] * 3], section_idx, cfg) if section_idx else hits
+            passages = "\n\n".join(f"[{i}] {h['text']}" for i, h in enumerate(context[:cfg["rt_answer_k"]], 1))
+            ans = rt_answer(cfg, RT_ANSWER_PROMPT, f"QUESTION:\n{q}\n\nPASSAGES:\n{passages}")
+            log.append({"query": q, "attempt": attempt, "answer": ans})
+            if ans is not None or attempt == cfg["rt_rewrites"]:
+                return ans
+            q = (llm_json(cfg, RT_REWRITE_PROMPT, f"{q}\n(rewrite #{attempt + 1})").get("query") or q).strip()
+
+    def solve(node, sibling_answers):
+        q = node["question"]
+        for n, a in enumerate(sibling_answers, 1):  # sequential: substitute earlier siblings' answers
+            q = q.replace(f"[answer {n}]", a or "unknown")
+        if not node["children"]:
+            return answer_leaf(q)
+        child_answers = []
+        for child in node["children"]:
+            child_answers.append(solve(child, child_answers if node["pattern"] == "sequential" else []))
+        if any(a is None for a in child_answers):  # adaptive leaf: the parent is searched directly
+            log.append({"query": q, "note": "child unanswered -> parent searched as a leaf"})
+            return answer_leaf(q)
+        subs = "\n".join(f"- {c['question']}: {a}" for c, a in zip(node["children"], child_answers))
+        ans = rt_answer(cfg, RT_COMBINE_PROMPT, f"QUESTION:\n{q}\n\nSUB-ANSWERS:\n{subs}")
+        log.append({"query": q, "combined_from_children": True, "answer": ans})
+        return ans
+
+    root_answer = solve(tree, [])
+    hits = round_robin_fuse(lists, k) if len(lists) > 1 else lists[0]
+    trace = {"rt_analysis": analysis, "rt_tree": tree, "rt_tree_shapes": shapes, "rt_steps": log,
+             "rt_root_answer": root_answer}
+    return hits, queries, trace
+
+
+def retrieve_for_question(question, cfg, col, embed, reranker, section_idx, trace=None):
+    """The full retrieval pipeline for one question: split → retrieve → rerank → fuse → [chain hop 2] → expand.
+    Returns (ranked hits, queries run). Shared by eval and multihop. If a trace dict is given, the chain hop
+    records its missing-info note and hop-2 queries in it."""
+    if cfg["rt_rag"]:  # RT-RAG replaces split → retrieve → fuse with a reasoning-tree traversal
+        hits, queries, rt_trace = rt_rag_retrieve(question, cfg, col, embed, reranker, section_idx)
+        if trace is not None:
+            trace.update(rt_trace)
+        return (expand_and_collapse(hits, section_idx, cfg) if section_idx else hits), queries
     k = cfg["top_k_retrieve"]
     # One query unless split_queries splits the question; then each query's list is fused.
     queries = make_queries(question, cfg)
@@ -494,6 +804,16 @@ def retrieve_for_question(question, cfg, col, embed, reranker, section_idx):
     else:
         fuse = {"rrf": rrf_fuse, "round_robin": round_robin_fuse}[cfg["fusion"]]
         hits = fuse(ranked_lists, k)
+    use_chain = cfg["chain_hops"] >= 2
+    if cfg["route"] == "llm":  # router: only predicted categories in chain_categories get the chain hop
+        category = llm_route(question, cfg)
+        use_chain = use_chain and category in cfg["chain_categories"]
+        if trace is not None:
+            trace.update(route_category=category, route_pipeline="chain" if use_chain else "base")
+    if use_chain:  # chain retrieval: LLM reads hop-1 passages, queries what is still missing
+        hits, missing, follow_ups = chain_hop(question, hits, cfg, col, embed, reranker, section_idx)
+        if trace is not None:
+            trace.update(chain_missing=missing, hop2_queries=follow_ups)
     if section_idx:
         hits = expand_and_collapse(hits, section_idx, cfg)
     return hits, queries
@@ -518,14 +838,20 @@ def cmd_eval(args):
             row = {"run_id": run_id, "item_id": item["id"], "category": item.get("category"),
                    "question": item["question"]}
             try:
-                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx)
+                trace = {}  # filled only by optional features (chain / RT-RAG / routing); empty otherwise
+                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx, trace)
                 if len(queries) > 1:
                     row["sub_queries"] = queries
+                row.update(trace)
                 row.update(score(item, hits, indexed_urls, all_chunk_texts))
                 row["ctx_words5"] = sum(len(h["text"].split()) for h in hits[:5])  # text the LLM would get in 5 slots
                 keys = ("rank", "chunk_rank", "retrieval_rank", "url", "chunk_id", "unit", "expanded_words",
                         "score", "rerank_score", "rrf_score")
                 row["top5"] = [{**{key: h[key] for key in keys if key in h}, "text": h["text"][:300]} for h in hits[:5]]
+            except LLMError as e:
+                f.close()
+                out_path.unlink()  # no partial results file, no run record; cached LLM responses are kept
+                sys.exit(f"\nLLM call failed on {item['id']}, run aborted (nothing recorded): {e}")
             except Exception as e:
                 row.update(quote_ranks=None, rank=None, miss_group=None,
                            error=f"{type(e).__name__}: {e}", trace=traceback.format_exc(limit=3))
@@ -556,6 +882,10 @@ def cmd_eval(args):
         "ctx_words5": ctx_words5(rows),
         "results_file": str(out_path.relative_to(ROOT)),
     }
+    if LLM_STATS["calls"] or LLM_STATS["cache_hits"]:  # only runs that use LLM features get these fields
+        run.update(llm_calls=LLM_STATS["calls"], llm_cache_hits=LLM_STATS["cache_hits"])
+    if route_summary(rows):
+        run.update(route_summary(rows))
     with open(RUNS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(run, ensure_ascii=False) + "\n")
 
@@ -566,6 +896,7 @@ def cmd_eval(args):
           f"misses 0/A/B/C = {run['miss_0']}/{run['miss_A']}/{run['miss_B']}/{run['miss_C']}")
     print_table([["category", "n", "Hit@5", "Hit@50", "MRR"]] +
                 [[c, len(by_cat[c]), m["hit5"], m["hit50"], m["mrr"]] for c, m in run["per_category"].items()])
+    print_route_summary(route_summary(rows))
     print("\nALL RUNS")
     print_runs_table(read_runs())
     if len(prev) >= 1:  # what changed vs the previous run
@@ -767,18 +1098,35 @@ def passage_miss_group(gold, rank, indexed_urls, all_chunk_texts):
 
 
 def multihop_metrics(rows):
+    """Item metrics from passage ranks (None = not retrieved). hit@k: any gold passage in the top k (like the
+    general eval's Hit@k); joint@k: all of them (headline: joint@5); mrr_first = 1/best rank (like the general
+    MRR); mrr_joint = 1/worst rank (depth needed to have all the evidence); passage_mrr = mean 1/rank per passage."""
     ok = [r for r in rows if not r.get("error")]
-    ranks = [rk for r in ok for rk in r["passage_ranks"]]
+    item_ranks = [[rk or float("inf") for rk in r["passage_ranks"]] for r in ok]
+    ranks = [rk for rs in item_ranks for rk in rs]
     groups = [g for r in ok for g in r["miss_groups"]]
     mean = lambda xs: round(sum(xs) / len(xs), 4) if xs else None
     return {
         "num_items": len(ok),
-        "joint_hit5": mean([r["joint_hit@5"] for r in ok]),
-        "joint_hit10": mean([r["joint_hit@10"] for r in ok]),
-        "passage_recall5": mean([r["passage_recall@5"] for r in ok]),
-        "passage_mrr": mean([1 / rk if rk else 0 for rk in ranks]),
+        "joint_hit5": mean([max(rs) <= 5 for rs in item_ranks]),
+        "joint_hit10": mean([max(rs) <= 10 for rs in item_ranks]),
+        "joint_hit50": mean([max(rs) <= 50 for rs in item_ranks]),
+        "hit5": mean([min(rs) <= 5 for rs in item_ranks]),
+        "hit10": mean([min(rs) <= 10 for rs in item_ranks]),
+        "hit50": mean([min(rs) <= 50 for rs in item_ranks]),
+        "passage_recall5": mean([sum(rk <= 5 for rk in rs) / len(rs) for rs in item_ranks]),
+        "passage_recall10": mean([sum(rk <= 10 for rk in rs) / len(rs) for rs in item_ranks]),
+        "mrr_first": mean([1 / min(rs) for rs in item_ranks]),
+        "mrr_joint": mean([1 / max(rs) for rs in item_ranks]),
+        "passage_mrr": mean([1 / rk for rk in ranks]),
         **{f"miss_{g}": groups.count(g) for g in ("0", "A", "B", "C")},
     }
+
+
+MULTIHOP_TABLE_COLS = (("joint@5", "joint_hit5"), ("joint@10", "joint_hit10"), ("joint@50", "joint_hit50"),
+                       ("Hit@5", "hit5"), ("Hit@10", "hit10"), ("Hit@50", "hit50"), ("recall@5", "passage_recall5"),
+                       ("recall@10", "passage_recall10"), ("MRR first", "mrr_first"), ("MRR joint", "mrr_joint"),
+                       ("passage MRR", "passage_mrr"))
 
 
 def read_multihop_runs():
@@ -789,22 +1137,25 @@ def read_multihop_runs():
 
 def print_multihop_runs_table(runs):
     labels = eval_set_labels(runs)
-    best = max(range(len(runs)), key=lambda i: (runs[i]["joint_hit5"] or -1, -i), default=None)
-    table = [["run_id", "what_changed", "config_diff", "joint@5", "joint@10", "recall@5", "0/A/B/C"]]
+    best = max(range(len(runs)), key=lambda i: (runs[i]["joint_hit5"] or -1, runs[i].get("mrr_joint") or -1, -i),
+               default=None)
+    table = [["run_id", "what_changed", "config_diff", *(c for c, _ in MULTIHOP_TABLE_COLS), "0/A/B/C"]]
     for i, r in enumerate(runs):
         diff = ", ".join(f"{k}: {o}->{n}" for k, (o, n) in r["config_diff"].items()) or "-"
         table.append([f"{r['run_id']} [{labels.get(r.get('eval_set_hash'), 'v?')}]" + (" *" if i == best else ""),
-                      r["what_changed"] or "", diff, r["joint_hit5"], r["joint_hit10"], r["passage_recall5"],
+                      r["what_changed"] or "", diff, *(r.get(key, "-") for _, key in MULTIHOP_TABLE_COLS),
                       f"{r['miss_0']}/{r['miss_A']}/{r['miss_B']}/{r['miss_C']}"])
     print_table(table, wrap={1: 30, 2: 30})
-    print("* = best joint@5   [vN] = multi-hop item set version   0/A/B/C = missing passages (not in top 5) by group")
+    print("* = best joint@5 (tie-break MRR joint)   [vN] = multi-hop item set version   "
+          "0/A/B/C = missing passages (not in top 5) by group   - = not computed (run multihop-rescore)")
 
 
 def cmd_multihop(args):
     name, cfg = load_config(args.config)
     col, page_urls, indexed_urls, all_chunk_texts, section_idx = open_eval_collection(name, cfg, args.config)
 
-    eval_items = [i for i in load_eval_items(EVAL_FILE) if i.get("category") == "multi-hop"]
+    # Item set = draft_multihop_v0 only; the eval_set multi-hop items are no longer mixed in (no duplicates).
+    eval_items = []
     draft_lines = [l for l in DRAFT_MULTIHOP_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
     report = validate_drafts(draft_lines, eval_items, indexed_urls, load_pages(RUN_DIR))
     MULTIHOP_DIR.mkdir(exist_ok=True)
@@ -828,7 +1179,7 @@ def cmd_multihop(args):
 
     passed = {e["id"] for e in report if e["status"] == "pass"}
     drafts = [d for d in map(json.loads, draft_lines) if d.get("id") in passed]
-    items = [(i, "eval_set") for i in eval_items] + [(d, "draft_v0") for d in drafts]
+    items = [(d, "draft_v0") for d in drafts]
 
     embed = make_embedder(cfg["embedding_model"])
     reranker = make_reranker(cfg["reranker"]) if cfg["reranker"] else None
@@ -840,9 +1191,11 @@ def cmd_multihop(args):
         for item, source in items:
             row = {"run_id": run_id, "item_id": item["id"], "source": source, "question": item["question"]}
             try:
-                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx)
-                if len(queries) > 1:
+                trace = {}
+                hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx, trace)
+                if queries != [item["question"]]:  # split, or rewritten by the LLM
                     row["sub_queries"] = queries
+                row.update(trace)
                 hit_texts = [norm_text(h["text"]) for h in hits]  # hits are in rank order, so position == rank
                 ranks = [first_rank(quote_fragments(g["quote"]), hit_texts) for g in item["gold_passages"]]
                 row.update({
@@ -855,6 +1208,10 @@ def cmd_multihop(args):
                     "top10": [{**{key: h[key] for key in ("rank", "url", "chunk_id", "score") if key in h},
                                "text": h["text"][:300]} for h in hits[:10]],
                 })
+            except LLMError as e:
+                f.close()
+                out_path.unlink()  # no partial results file, no run record; cached LLM responses are kept
+                sys.exit(f"\nLLM call failed on {item['id']}, run aborted (nothing recorded): {e}")
             except Exception as e:
                 row.update(error=f"{type(e).__name__}: {e}", trace=traceback.format_exc(limit=3))
                 print(f"  ERROR {item['id']}: {row['error']}")
@@ -876,19 +1233,23 @@ def cmd_multihop(args):
         "num_items": {s: len(rs) for s, rs in by_source.items()},
         "num_drafts_rejected": counts["fail"],
         "num_errors": sum(bool(r.get("error")) for r in rows),
+        "llm_calls": LLM_STATS["calls"], "llm_cache_hits": LLM_STATS["cache_hits"],
         **multihop_metrics(rows),
+        **(route_summary(rows, "multi-hop") or {}),
         "by_source": {s: multihop_metrics(rs) for s, rs in sorted(by_source.items())},
         "results_file": str(out_path.relative_to(ROOT)),
     }
     with open(MULTIHOP_RUNS, "a", encoding="utf-8") as f:
         f.write(json.dumps(run, ensure_ascii=False) + "\n")
 
-    print(f"\nMULTI-HOP RUN {run_id}  collection={name}  items={run['num_items']}  errors={run['num_errors']}")
-    table = [["source", "items", "joint@5", "joint@10", "recall@5", "passage MRR", "missing 0/A/B/C"]]
+    print(f"\nMULTI-HOP RUN {run_id}  collection={name}  items={run['num_items']}  errors={run['num_errors']}  "
+          f"LLM calls={run['llm_calls']} cache hits={run['llm_cache_hits']}")
+    table = [["source", "items", *(c for c, _ in MULTIHOP_TABLE_COLS), "missing 0/A/B/C"]]
     for label, m in [*run["by_source"].items(), ("ALL", multihop_metrics(rows))]:
-        table.append([label, m["num_items"], m["joint_hit5"], m["joint_hit10"], m["passage_recall5"], m["passage_mrr"],
+        table.append([label, m["num_items"], *(m[key] for _, key in MULTIHOP_TABLE_COLS),
                       f"{m['miss_0']}/{m['miss_A']}/{m['miss_B']}/{m['miss_C']}"])
     print_table(table)
+    print_route_summary(route_summary(rows, "multi-hop"))
     print("\nALL MULTI-HOP RUNS")
     print_multihop_runs_table(read_multihop_runs())
 
@@ -907,8 +1268,7 @@ def cmd_multihop_compare(args):
               f"({len(set(a) - set(b))} only in run 1, {len(set(b) - set(a))} only in run 2).")
     m1, m2 = multihop_metrics([a[i] for i in shared]), multihop_metrics([b[i] for i in shared])
     table = [["metric", args.run_1, args.run_2, "change"]]
-    for label, key in (("joint@5", "joint_hit5"), ("joint@10", "joint_hit10"), ("recall@5", "passage_recall5"),
-                       ("passage MRR", "passage_mrr")):
+    for label, key in MULTIHOP_TABLE_COLS:
         delta = "" if m1[key] is None or m2[key] is None else f"{m2[key] - m1[key]:+.4f}"
         table.append([label, m1[key], m2[key], delta])
     groups = lambda m: f"{m['miss_0']}/{m['miss_A']}/{m['miss_B']}/{m['miss_C']}"
@@ -932,6 +1292,31 @@ def cmd_multihop_compare(args):
         print(f"\n{title} ({len(lines)})")
         print_table([header] + lines) if lines else print("  none")
     print(f"\nunchanged: {len(shared) - len(better) - len(worse)}")
+
+
+def cmd_multihop_rescore(args):
+    """Add metrics that a past run lacks, recomputed from its saved passage ranks (no retrieval). Existing
+    values in runs.jsonl are never overwritten."""
+    runs = read_multihop_runs()
+    for run in runs:
+        if args.run_ids and run["run_id"] not in args.run_ids:
+            continue
+        rows = [json.loads(l) for l in (ROOT / run["results_file"]).read_text(encoding="utf-8").splitlines() if l.strip()]
+        added = [k for k in multihop_metrics(rows) if k not in run and k != "num_items"]  # num_items is a dict here
+        for k in added:
+            run[k] = multihop_metrics(rows)[k]
+        by_source = defaultdict(list)
+        for r in rows:
+            by_source[r["source"]].append(r)
+        for s, rs in by_source.items():
+            for k, v in multihop_metrics(rs).items():
+                run["by_source"].setdefault(s, {}).setdefault(k, v)
+        print(f"  {run['run_id']}: added {', '.join(added) or 'nothing'}")
+    with open(MULTIHOP_RUNS, "w", encoding="utf-8") as f:
+        for run in runs:
+            f.write(json.dumps(run, ensure_ascii=False) + "\n")
+    print("\nALL MULTI-HOP RUNS")
+    print_multihop_runs_table(runs)
 
 
 def main():
@@ -958,9 +1343,12 @@ def main():
     p = sub.add_parser("multihop-compare", help="items that improved / got worse between two multi-hop runs")
     p.add_argument("run_1")
     p.add_argument("run_2")
+    p = sub.add_parser("multihop-rescore", help="add new metrics to past multi-hop runs from their saved ranks")
+    p.add_argument("run_ids", nargs="*", help="runs to rescore (default: all)")
     args = ap.parse_args()
     {"index": cmd_index, "eval": cmd_eval, "compare": cmd_compare, "table": cmd_table,
-     "multihop": cmd_multihop, "multihop-compare": cmd_multihop_compare}[args.cmd](args)
+     "multihop": cmd_multihop, "multihop-compare": cmd_multihop_compare,
+     "multihop-rescore": cmd_multihop_rescore}[args.cmd](args)
 
 
 if __name__ == "__main__":
