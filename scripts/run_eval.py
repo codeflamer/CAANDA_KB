@@ -2,6 +2,7 @@
 
 Usage (from repo root):
     .venv/Scripts/python scripts/run_eval.py --category single-fact
+    .venv/Scripts/python scripts/run_eval.py --pipeline v0     (v2 = retrieval_eval pipeline, default; v0 = original MiniLM RAG)
 """
 import argparse
 import json
@@ -39,7 +40,9 @@ load_dotenv(ROOT / ".env")
 # call_rag uses paths relative to scripts/ (indexes/chroma, ../data/raw/...)
 os.chdir(ROOT / "scripts")
 sys.path.insert(0, str(ROOT / "scripts"))
-from add_to_vdb import call_rag  # noqa: E402
+from add_to_vdb import call_rag, v2_settings  # noqa: E402
+sys.path.insert(0, str(ROOT))
+import retrieval_eval as RE  # noqa: E402  (fixed quote matching: word tokens + "..." fragments)
 
 
 # ---------- retrieval check ----------
@@ -68,11 +71,17 @@ def check_retrieval(item, chunks, manifest):
     for g in golds:
         q = norm(g["quote"])
         quote_ranks.append(next((c["rank"] for c in chunks if q in norm(c["text"])), None))
+    # Fixed check (as in retrieval_eval.py): quotes are split on "..." and each fragment must appear in one chunk.
+    # The check above is kept unchanged so results stay comparable with earlier runs.
+    texts = [RE.norm_text(c["text"]) for c in chunks]
+    fixed_ranks = [RE.first_rank(RE.quote_fragments(g["quote"]), texts) for g in golds]
     return {
         "url_retrieved": url_rank is not None,
         "quote_retrieved": all(r is not None for r in quote_ranks),
         "url_rank": url_rank,
         "quote_ranks": quote_ranks,
+        "quote_retrieved_fixed": all(r is not None for r in fixed_ranks),
+        "quote_ranks_fixed": fixed_ranks,
     }
 
 
@@ -143,11 +152,13 @@ def failure_type(row):
 
 
 # ---------- run ----------
-def eval_one(client, judge_model, item, manifest):
+def eval_one(client, judge_model, item, manifest, pipeline="v0"):
     row = {"id": item["id"], "category": item.get("category"), "question": item["question"]}
     stage = "rag"
     try:
-        hits, answer = call_rag(item["question"])
+        trace = {}  # v2 only: router category, chain / sub-queries
+        hits, answer = call_rag(item["question"], pipeline=pipeline, trace=trace)
+        row.update(trace)
         chunks = [{"rank": i, "url": h.get("url"), "score": round(h.get("score", 0), 4), "text": h.get("text", "")}
                   for i, h in enumerate(hits, 1)]
         row.update(answer=answer, chunks=chunks)
@@ -167,7 +178,7 @@ def print_summary(rows):
     by_cat = defaultdict(list)
     for r in rows:
         by_cat[r["category"]].append(r)
-    cols = ["n", "quote_ret", "correct", "partial", "incorrect", "grounded", "errors"]
+    cols = ["n", "quote_ret", "quote_ret_fixed", "correct", "partial", "incorrect", "grounded", "errors"]
 
     def stats(rs):
         ok = [r for r in rs if not r.get("error")]
@@ -175,6 +186,7 @@ def print_summary(rows):
         return [
             len(rs),
             f"{sum(r['quote_retrieved'] for r in applicable)}/{len(applicable)}" if applicable else "n/a",
+            f"{sum(r['quote_retrieved_fixed'] for r in applicable)}/{len(applicable)}" if applicable else "n/a",
             sum(r.get("verdict") == "correct" for r in ok),
             sum(r.get("verdict") == "partial" for r in ok),
             sum(r.get("verdict") == "incorrect" for r in ok),
@@ -198,6 +210,8 @@ def main():
     ap.add_argument("--category", help="only run this category, e.g. single-fact")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--judge-model", default="gpt-5")
+    ap.add_argument("--pipeline", choices=("v0", "v2"), default="v2",
+                    help="v0 = original MiniLM RAG; v2 = retrieval_eval pipeline (routed chain config)")
     args = ap.parse_args()
 
     items = [json.loads(l) for l in Path(args.eval_file).read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -219,11 +233,17 @@ def main():
 
     client = OpenAI(max_retries=3)
     RESULTS_DIR.mkdir(exist_ok=True)
+    # Runs started in the same second (e.g. v0 and v2 in parallel) would share a run id and results file:
+    # take the next free suffix and open exclusively, so a run never overwrites another run's results.
+    n_try = 1
+    while (RESULTS_DIR / f"{run_id}.jsonl").exists():
+        n_try += 1
+        run_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{n_try}"
     out_path = RESULTS_DIR / f"{run_id}.jsonl"
     rows = []
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(out_path, "x", encoding="utf-8") as f:
         for n, item in enumerate(items, 1):
-            row = eval_one(client, args.judge_model, item, manifest)
+            row = eval_one(client, args.judge_model, item, manifest, args.pipeline)
             rows.append(row)
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
@@ -234,7 +254,8 @@ def main():
     with open(RUNS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps({
             "run_id": run_id, "date": now.isoformat(timespec="seconds"), "git_commit": commit,
-            "rag": RAG_SETTINGS, "judge_model": args.judge_model,
+            "pipeline": args.pipeline, "rag": RAG_SETTINGS if args.pipeline == "v0" else v2_settings(),
+            "judge_model": args.judge_model,
             "eval_file": str(Path(args.eval_file).resolve().relative_to(ROOT)),
             "category_filter": args.category, "limit": args.limit, "n": len(rows),
             "results_file": str(out_path.relative_to(ROOT)), 
