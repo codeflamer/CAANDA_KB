@@ -18,7 +18,7 @@ import sys
 import textwrap
 import traceback
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,7 +48,8 @@ DEFAULTS = {"chunking_method": "section_words", "add_heading_path": True, "top_k
             "decompose_prompt": "v1",
             "rt_rag": False, "rt_trees": 5, "rt_max_leaves": 4, "rt_answer_k": 3, "rt_rewrites": 3,
             "rt_answer_samples": 1,
-            "route": "none", "chain_categories": ["multi-hop"]}
+            "route": "none", "chain_categories": ["multi-hop"],
+            "bm25_k": 0}
 # Settings baked into a collection at index time; eval refuses a config that disagrees with the collection.
 INDEX_SETTINGS = ("embedding_model", "chunking_method", "chunk_size", "chunk_overlap", "add_heading_path", "dedupe_chunks")
 
@@ -269,6 +270,62 @@ def retrieve(col, embed, question, k):
     return [{"rank": i, "url": norm_url(m.get("url")), "chunk_id": m.get("chunk_id", id_),
              "score": round(1 - d, 4), "text": doc}
             for i, (id_, doc, m, d) in enumerate(zip(r["ids"][0], r["documents"][0], r["metadatas"][0], r["distances"][0]), 1)]
+
+
+# ---------- BM25 (bm25_k > 0): sparse candidates added to the dense pool before the rerank ----------
+STOPWORDS = frozenset("a an and are as at be but by can could do does for from had has have how i if in into is it "
+                      "its me my no not of on or our so than that the their them then there these they this to was "
+                      "we were what when where which who why will with would you your".split())
+
+
+def bm25_tokens(text):
+    return [t for t in norm_text(text).split() if t not in STOPWORDS]
+
+
+class BM25:
+    """Okapi BM25 (k1 1.5, b 0.75, non-negative idf) over the same chunk texts as the dense index, heading path
+    included. Built from an ExactSearch, so chunks are in chunk-id order and ties break by chunk id."""
+
+    def __init__(self, ids, documents, metadatas, k1=1.5, b=0.75):
+        self.ids, self.documents, self.metadatas, self.k1 = ids, documents, metadatas, k1
+        lengths = np.zeros(len(documents), dtype=np.float32)
+        postings = defaultdict(lambda: ([], []))  # term -> (chunk indexes, term frequencies)
+        for i, doc in enumerate(documents):
+            toks = bm25_tokens(doc)
+            lengths[i] = len(toks)
+            for t, tf in Counter(toks).items():
+                postings[t][0].append(i)
+                postings[t][1].append(tf)
+        self.norm = k1 * (1 - b + b * lengths / lengths.mean())  # per-chunk length normalisation
+        n = len(documents)
+        self.postings = {t: (np.asarray(d), np.asarray(f, dtype=np.float32), np.log((n - len(d) + 0.5) / (len(d) + 0.5) + 1))
+                         for t, (d, f) in postings.items()}
+
+    def search(self, query, k):
+        scores = np.zeros(len(self.documents), dtype=np.float32)
+        for t in set(bm25_tokens(query)):
+            if t in self.postings:
+                docs, tf, idf = self.postings[t]
+                scores[docs] += idf * tf * (self.k1 + 1) / (tf + self.norm[docs])
+        top = [i for i in np.argsort(-scores, kind="stable")[:k] if scores[i] > 0]
+        return [{"rank": r, "url": norm_url(self.metadatas[i].get("url")), "chunk_id": self.metadatas[i].get("chunk_id", self.ids[i]),
+                 "bm25_score": round(float(scores[i]), 4), "bm25_rank": r, "text": self.documents[i]}
+                for r, i in enumerate(top, 1)]
+
+
+def candidates(col, embed, q, cfg):
+    """Candidate pool for one query: the dense top top_k_retrieve; with bm25_k > 0 also the BM25 top bm25_k chunks
+    the dense list missed, appended in BM25 order (the reranker sets the final order). Dense hits BM25 also
+    found carry their bm25_rank."""
+    hits = retrieve(col, embed, cfg["query_prefix"] + q, cfg["top_k_retrieve"])  # prefix: bge-style query instruction
+    if not cfg["bm25_k"]:
+        return hits
+    sparse = col.bm25.search(q, cfg["bm25_k"])  # raw query: the prefix is for the embedding model only
+    bm25_rank = {h["chunk_id"]: h["rank"] for h in sparse}
+    pool = [{**h, **({"bm25_rank": bm25_rank[h["chunk_id"]]} if h["chunk_id"] in bm25_rank else {})} for h in hits]
+    dense_ids = {h["chunk_id"] for h in hits}
+    pool += [h for h in sparse if h["chunk_id"] not in dense_ids]
+    return [{**h, "rank": i} for i, h in enumerate(pool, 1)]
 
 
 def make_reranker(model_name):
@@ -574,6 +631,34 @@ def metrics(rows):
     }
 
 
+def miss_counts(rows):
+    return {f"miss_{g}": sum(r["miss_group"] == g for r in rows) for g in ("0", "A", "B", "C")}
+
+
+# ---------- dev / test split ----------
+# Eval sets with a `split` field (eval_set_v3): compare experiments on dev; test is held out. Test rows are
+# scored and recorded like any other, but hidden from eval / compare / table output unless --show-test.
+def visible(rows, show_test):
+    return rows if show_test else [r for r in rows if r.get("split") != "test"]
+
+
+def split_metrics(rows):
+    """{split: metrics + n + miss counts}, or {} if the eval set has no split field."""
+    by_split = defaultdict(list)
+    for r in rows:
+        if r.get("split"):
+            by_split[r["split"]].append(r)
+    return {s: {"n": len(rs), **metrics(rs), **miss_counts(rs)} for s, rs in sorted(by_split.items())}
+
+
+def run_view(run, show_test):
+    """The run's headline numbers as the user may see them: dev-only when the run has a hidden test split."""
+    ps = run.get("per_split") or {}
+    if show_test or "test" not in ps or "dev" not in ps:
+        return run, False
+    return ps["dev"], True
+
+
 def ctx_words5(rows):
     """Mean words in the top-5 units: Hit@5 with bigger units (section expansion) costs more context."""
     vals = [r["ctx_words5"] for r in rows if not r.get("error") and "ctx_words5" in r]
@@ -610,6 +695,8 @@ def open_eval_collection(name, cfg, config_path):
     exact = cfg["search"] == "exact"
     if cfg["search"] not in ("hnsw", "exact"):
         sys.exit(f"search must be 'hnsw' or 'exact', got {cfg['search']!r}")
+    if cfg["bm25_k"] and not exact:
+        sys.exit("bm25_k needs search: exact (BM25 is built from the exact-search chunk list)")
     everything = col.get(include=["documents", "metadatas", *(["embeddings"] if exact else [])])
     # a deduplicated chunk also stands for the pages listed in also_urls
     page_urls = {u for m in everything["metadatas"] for u in [m.get("url"), *json.loads(m.get("also_urls") or "[]")]}
@@ -623,6 +710,8 @@ def open_eval_collection(name, cfg, config_path):
         all_chunk_texts = [norm_text(d) for d in everything["documents"]]
     if exact:
         col = ExactSearch(everything["ids"], everything["documents"], everything["metadatas"], everything["embeddings"])
+        if cfg["bm25_k"]:
+            col.bm25 = BM25(col.ids, col.documents, col.metadatas)
     return col, page_urls, indexed_urls, all_chunk_texts, section_idx
 
 
@@ -635,7 +724,7 @@ def chain_hop(question, hits, cfg, col, embed, reranker, section_idx):
     missing, follow_ups = llm_follow_up(question, context, cfg)
     lists = [hits]
     for q in follow_ups:
-        h2 = retrieve(col, embed, cfg["query_prefix"] + q, k)
+        h2 = candidates(col, embed, q, cfg)
         lists.append(rerank(reranker, q, h2) if reranker else h2)
     return (round_robin_fuse(lists, k) if follow_ups else hits), missing, follow_ups
 
@@ -795,7 +884,7 @@ def retrieve_for_question(question, cfg, col, embed, reranker, section_idx, trac
     queries = make_queries(question, cfg)
     ranked_lists = []
     for q in queries:
-        hits = retrieve(col, embed, cfg["query_prefix"] + q, k)  # prefix: bge-style query instruction
+        hits = candidates(col, embed, q, cfg)
         if reranker:
             hits = rerank(reranker, q, hits)
         ranked_lists.append(hits)
@@ -837,6 +926,8 @@ def cmd_eval(args):
         for item in items:
             row = {"run_id": run_id, "item_id": item["id"], "category": item.get("category"),
                    "question": item["question"]}
+            if item.get("split"):
+                row["split"] = item["split"]
             try:
                 trace = {}  # filled only by optional features (chain / RT-RAG / routing); empty otherwise
                 hits, queries = retrieve_for_question(item["question"], cfg, col, embed, reranker, section_idx, trace)
@@ -846,7 +937,7 @@ def cmd_eval(args):
                 row.update(score(item, hits, indexed_urls, all_chunk_texts))
                 row["ctx_words5"] = sum(len(h["text"].split()) for h in hits[:5])  # text the LLM would get in 5 slots
                 keys = ("rank", "chunk_rank", "retrieval_rank", "url", "chunk_id", "unit", "expanded_words",
-                        "score", "rerank_score", "rrf_score")
+                        "score", "rerank_score", "rrf_score", "bm25_rank")
                 row["top5"] = [{**{key: h[key] for key in keys if key in h}, "text": h["text"][:300]} for h in hits[:5]]
             except LLMError as e:
                 f.close()
@@ -877,8 +968,9 @@ def cmd_eval(args):
         "num_errors": sum(bool(r.get("error")) for r in rows),
         "missing_pages": missing_pages, 
         **metrics(rows),
-        **{f"miss_{g}": sum(r["miss_group"] == g for r in rows) for g in ("0", "A", "B", "C")},
+        **miss_counts(rows),
         "per_category": {c: metrics(rs) for c, rs in sorted(by_cat.items())},
+        **({"per_split": split_metrics(rows)} if split_metrics(rows) else {}),
         "ctx_words5": ctx_words5(rows),
         "results_file": str(out_path.relative_to(ROOT)),
     }
@@ -892,15 +984,26 @@ def cmd_eval(args):
     print(f"\nRUN {run_id}  collection={name}  questions={run['num_questions']}  errors={run['num_errors']}")
     if missing_pages:
         print(f"  WARNING: {len(missing_pages)} gold page(s) not indexed -> those questions are miss group 0")
-    print(f"  Hit@5={run['hit5']}  Hit@50={run['hit50']}  MRR={run['mrr']}  "
-          f"misses 0/A/B/C = {run['miss_0']}/{run['miss_A']}/{run['miss_B']}/{run['miss_C']}")
+    shown = visible(rows, args.show_test)
+    if len(shown) < len(rows):
+        print(f"  DEV SPLIT ONLY: {len(rows) - len(shown)} test questions scored and recorded but hidden "
+              f"(--show-test, or `compare --show-test`, to see them)")
+    m, g = metrics(shown), miss_counts(shown)
+    print(f"  Hit@5={m['hit5']}  Hit@50={m['hit50']}  MRR={m['mrr']}  "
+          f"misses 0/A/B/C = {g['miss_0']}/{g['miss_A']}/{g['miss_B']}/{g['miss_C']}")
+    shown_cat = defaultdict(list)
+    for r in shown:
+        shown_cat[r["category"]].append(r)
     print_table([["category", "n", "Hit@5", "Hit@50", "MRR"]] +
-                [[c, len(by_cat[c]), m["hit5"], m["hit50"], m["mrr"]] for c, m in run["per_category"].items()])
+                [[c, len(rs), *(metrics(rs)[k] for k in ("hit5", "hit50", "mrr"))] for c, rs in sorted(shown_cat.items())])
+    if args.show_test and run.get("per_split"):
+        print_table([["split", "n", "Hit@5", "Hit@50", "MRR"]] +
+                    [[s, v["n"], v["hit5"], v["hit50"], v["mrr"]] for s, v in run["per_split"].items()])
     print_route_summary(route_summary(rows))
     print("\nALL RUNS")
-    print_runs_table(read_runs())
+    print_runs_table(read_runs(), args.show_test)
     if len(prev) >= 1:  # what changed vs the previous run
-        cmd_compare(argparse.Namespace(run_1=prev[-1]["run_id"], run_2=run_id))
+        cmd_compare(argparse.Namespace(run_1=prev[-1]["run_id"], run_2=run_id, show_test=args.show_test))
 
 
 # ---------- tables ----------
@@ -925,23 +1028,27 @@ def print_table(table, wrap=None):
     print(rule("└", "┴", "┘"))
 
 
-def print_runs_table(runs):
+def print_runs_table(runs, show_test=False):
     labels = eval_set_labels(read_runs())  # labels from the full history, so they don't shift when filtering
     label = lambda r: labels.get(r.get("eval_set_hash"), "v?")
+    views = [run_view(r, show_test) for r in runs]
     best = {}  # best Hit@5 per eval set version: scores on different question sets aren't comparable
-    for i, r in enumerate(runs):
-        v = label(r)
-        if r["hit5"] is not None and (v not in best or r["hit5"] > runs[best[v]]["hit5"]):
+    for i, (m, _) in enumerate(views):
+        v = label(runs[i])
+        if m["hit5"] is not None and (v not in best or m["hit5"] > views[best[v]][0]["hit5"]):
             best[v] = i
     table = [["run", "what changed", "Hit@5", "Hit@50", "MRR", "0/A/B/C"]]
     for i, r in enumerate(runs):
+        m, dev_only = views[i]
         if i and label(r) != label(runs[i - 1]):
-            table.append([f"── eval set {label(r)} ──", f"{r.get('eval_set_n', r['num_questions'])} questions", "", "", "", ""])
-        mark = ("!" if r["missing_pages"] else "") + (" *" if best.get(label(r)) == i else "")
+            n = f"{m['n']} dev of " if dev_only else ""
+            table.append([f"── eval set {label(r)} ──", f"{n}{r.get('eval_set_n', r['num_questions'])} questions", "", "", "", ""])
+        mark = ("!" if r["missing_pages"] else "") + (" dev" if dev_only else "") + (" *" if best.get(label(r)) == i else "")
         table.append([f"{r['run_id']} [{label(r)}]{mark}", r["what_changed"] or "",
-                      r["hit5"], r["hit50"], r["mrr"], f"{r['miss_0']}/{r['miss_A']}/{r['miss_B']}/{r['miss_C']}"])
+                      m["hit5"], m["hit50"], m["mrr"], f"{m['miss_0']}/{m['miss_A']}/{m['miss_B']}/{m['miss_C']}"])
     print_table(table, wrap={1: 30})
-    print("[vN] = eval set version   * = best Hit@5 within that version   ! = run had gold pages missing from the index")
+    print("[vN] = eval set version   * = best Hit@5 within that version   ! = run had gold pages missing from the index"
+          + ("   dev = dev split only, test held out (--show-test)" if any(d for _, d in views) else ""))
 
 
 def cmd_table(args):
@@ -950,7 +1057,7 @@ def cmd_table(args):
     if args.run_ids:
         by_id = {r["run_id"]: r for r in runs}
         runs = [by_id[i] for i in args.run_ids]
-    results = [{x["item_id"]: x for x in map(json.loads, (ROOT / r["results_file"]).read_text(encoding="utf-8").splitlines())}
+    results = [{x["item_id"]: x for x in visible(list(map(json.loads, (ROOT / r["results_file"]).read_text(encoding="utf-8").splitlines())), args.show_test)}
                for r in runs]
 
     def cell(x):
@@ -960,7 +1067,7 @@ def cmd_table(args):
             return f"{x['rank']} ✓"
         return f"{'-' if x['rank'] is None else x['rank']} ({x['miss_group']})"
 
-    print_runs_table(runs)
+    print_runs_table(runs, args.show_test)
     print()
     item_ids = list(dict.fromkeys(i for res in results for i in res))
     table = [["item", "category", *[r["run_id"] for r in runs]]]
@@ -968,7 +1075,7 @@ def cmd_table(args):
         category = next(res[iid]["category"] for res in results if iid in res)
         table.append([iid, category, *[cell(res.get(iid)) for res in results]])
     for label, key in (("Hit@5", "hit5"), ("Hit@50", "hit50"), ("MRR", "mrr")):
-        table.append([label, "", *[r[key] for r in runs]])
+        table.append([label, "", *[run_view(r, args.show_test)[0][key] for r in runs]])
     print_table(table)
     print("✓ = hit (rank <= 5)   - = not in top k   (0/A/B/C) = miss group   rank = worst of the question's quote ranks")
 
@@ -987,10 +1094,15 @@ def cmd_compare(args):
         return {r["item_id"]: r for r in map(json.loads, path.read_text(encoding="utf-8").splitlines()) if r}
 
     a, b = load(args.run_1), load(args.run_2)
+    show_test = getattr(args, "show_test", False)
+    hidden = {i for res in (a, b) for i, r in res.items() if r.get("split") == "test"} if not show_test else set()
+    a, b = ({i: r for i, r in res.items() if i not in hidden} for res in (a, b))
     shared = sorted(set(a) & set(b))
     labels = eval_set_labels(all_runs)
     v1, v2 = (labels.get(runs.get(r, {}).get("eval_set_hash"), "v?") for r in (args.run_1, args.run_2))
     print(f"\nCOMPARE {args.run_1} [{v1}] -> {args.run_2} [{v2}]")
+    if hidden:
+        print(f"  DEV SPLIT ONLY: {len(hidden)} test questions hidden (--show-test to include them).")
     if v1 != v2 or set(a) != set(b):
         print(f"  Different eval set versions: metrics below are recomputed on the {len(shared)} shared questions "
               f"({len(set(a) - set(b))} only in run 1, {len(set(b) - set(a))} only in run 2).")
@@ -1331,11 +1443,15 @@ def main():
     p.add_argument("--config", required=True)
     p.add_argument("--change", required=True, help="what you changed since the last run")
     p.add_argument("--eval-file", default=str(EVAL_FILE), help="eval set to score (default: %(default)s)")
+    show_test_help = "also show the held-out test split (eval sets with a `split` field); default: dev only"
+    p.add_argument("--show-test", action="store_true", help=show_test_help)
     p = sub.add_parser("compare")
     p.add_argument("run_1", nargs="?", help="default: previous run")
     p.add_argument("run_2", nargs="?", help="default: latest run")
+    p.add_argument("--show-test", action="store_true", help=show_test_help)
     p = sub.add_parser("table", help="per-question ranks side by side")
     p.add_argument("run_ids", nargs="*", help="runs to show (default: all)")
+    p.add_argument("--show-test", action="store_true", help=show_test_help)
     p = sub.add_parser("multihop", help="multi-hop eval (eval_set multi-hop items + validated drafts)")
     p.add_argument("--config", required=True)
     p.add_argument("--change", required=True, help="what you changed since the last multi-hop run")

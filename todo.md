@@ -7,11 +7,16 @@
 
 ## Next: make the harness credible
 ### Eval set
-- [ ] Grow eval_set beyond 25 scored questions (5 per category is too few: one question = 0.2 of a category score)
-- [ ] Human-verify every item, including the 17 LLM-drafted multi-hop items; record `verified_by`
-- [ ] Held-out test split: tune on a dev split only, report final numbers on a test split never used for tuning
-      (current scores are optimistic — the pipeline was tuned on the same 25 + 22 questions)
-- [ ] Re-verify gold quotes automatically when a page's content_hash changes after a re-crawl; flag stale temporal items
+- [x] Grow eval_set beyond 25 scored questions — `data/eval_set/eval_set_v3.jsonl` (2026-10-16): 60 items, 10 per
+      category, 50 scored; built with `scripts/build_eval_set.py` (auto-check + human review). Retrieval-only for now;
+      end-to-end (generation + judge) stays on the 30-item `eval_set.jsonl` until the pipeline is stable (token cost)
+- [ ] Human-verify every item: done for the 60 in v3; remaining drafts (73) still unverified, incl. mh-011..022
+- [x] Held-out test split: v3 tags `split` (30 dev = old set, 30 test = new); `retrieval_eval.py` records
+      `per_split` and shows dev only unless `--show-test` (2026-10-16). Caveat: mh-006..010 are `test` but were in
+      the 22-item multi-hop tuning set. Not yet in `run_eval.py` (end-to-end stays on the 30 for now)
+- [ ] Grow further (draft pools hold 17–25 per category; one item is still 0.2 of a category slice)
+- [x] Re-verify gold quotes after a re-crawl; flag stale temporal items — `scripts/check_gold.py --new data/raw/<date>`
+      (2026-10-16; tested on a synthetic snapshot, not yet on a real re-crawl)
 
 ### Judge validation
 - [ ] Hand-label a sample of answers (correct / partial / incorrect, grounded) and measure agreement with the gpt-5 judge
@@ -52,6 +57,14 @@
 
 Rejected: bge-reranker-base (no better than ms-marco); chain retrieval on every question (Hit@5 0.68, hurts
 one-passage questions).
+
+## Done: eval set v3 reference runs (50 scored; dev = old 25, test = new 25)
+| Config | all Hit@5 | dev Hit@5 | test Hit@5 | all MRR | test MRR | Run |
+|---|---|---|---|---|---|---|
+| pre-chain (expand_exact) | 0.68 | 0.72 | 0.64 | 0.421 | 0.343 | 20261016-024615 |
+| routed (FINAL) | 0.70 | 0.72 | 0.68 | 0.436 | 0.367 | 20261016-025807 |
+- New items score lower than the tuned-on ones (test Hit@5 0.68 vs dev 0.72; MRR 0.37 vs 0.50). Weakest test
+  slices: single-fact 0.4 (sf-0006/0009/0010 at ranks 8/15/15), ambiguous 0.4 (amb-006 never retrieved)
 
 ## Done: multi-hop eval (22 questions, `retrieval_eval.py multihop`; joint@5 = both passages in top 5)
 - [x] Extended metrics (joint@5/10/50, Hit@k, recall, MRR first/joint); item set = draft_multihop_v0 only; mh-003 quote fixed

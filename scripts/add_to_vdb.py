@@ -289,6 +289,6 @@ def call_rag(question, pipeline="v2", trace=None):
 
 if __name__ == "__main__":
     # print(call_rag("what to i need to do to study in canada?"))
-    retrieved_hits, model_answer = call_rag("How much proof of funds do i need as a single person?")
+    retrieved_hits, model_answer = call_rag("Do i need a permit to study in canada?")
     # print(retrieved_hits)
     print(model_answer)

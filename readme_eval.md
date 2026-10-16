@@ -9,6 +9,7 @@ a gold passage must follow so that `retrieval_eval.py` (retrieval-only) and `scr
 | File | What it is |
 |---|---|
 | `eval_set.jsonl` | **The eval set used by both harnesses.** 30 items, 5 per category, all human-verified. |
+| `eval_set_v3.jsonl` | **Larger retrieval-only set** (built 2026-10-16): 60 items, 10 per category, all human-verified, 50 with gold passages. The 30 `eval_set.jsonl` items (unchanged, `split: dev`) + 5 approved drafts per category (`split: test`, `source_file` = the draft file). Built by `scripts/build_eval_set.py` (`candidates` auto-checks drafts and writes `review_v3.md`; `freeze --approve ...` writes the file). Use with `retrieval_eval.py eval --eval-file data/eval_set/eval_set_v3.jsonl`. End-to-end (`run_eval.py`, generation + gpt-5 judge) stays on `eval_set.jsonl` until the pipeline is stable, to save tokens. |
 | `draft_<category>_v0.jsonl` | Candidate pools per category (17–25 items each). Mostly `llm_draft` / `unverified`. Items are promoted into `eval_set.jsonl` after review. |
 | `eval_set_singlefact.jsonl` | Candidate pool for `single-fact` (older, simpler schema with `answer`, `valid_until`, `stale_risk`). |
 
@@ -34,6 +35,7 @@ One JSON object per line, UTF-8.
 | `verified_by` | str | `human` once a person has checked question, answer and every quote against the `.txt` file; otherwise `unverified`. Only `human` items go into `eval_set.jsonl`. |
 | `vocab_overlap_flag` | str | Which words/phrases the question shares with the gold quote (`"none"` if only generic terms). Questions should paraphrase, so retrieval is not tested by copy-paste. |
 | `notes` | str | Category-specific justification (see below). |
+| `split` | dev·test | v3 only. `dev` = the original 30 (the pipeline was tuned on them); `test` = items added in v3, meant as held-out. Not read by any script yet. Caveat: mh-006..010 are `test` but were in the 22-item multi-hop set used to tune chain retrieval. |
 
 ## How items are generated
 
@@ -116,7 +118,13 @@ must be retrieved for the question to count as a hit (question rank = worst quot
 - `content_hash` must match the manifest row for that page. It identifies the exact page version
   and is authoritative if the URL is ambiguous. (Known issue: `sf-0004` has the URL without its `?q=` part;
   its `content_hash` points to the right page.)
-- After a re-crawl, re-check every quote whose page's `content_hash` changed.
+- After a re-crawl, run `scripts/check_gold.py --new data/raw/<date>` (report only, never edits the eval sets).
+  It re-matches every gold quote against the new page text (`content_hash` hashes the raw HTML, so it also
+  changes on markup-only edits) and reports each passage as `unchanged`, `changed-ok` (quote still there; new
+  hash suggested), `BROKEN` (quote gone), `MISSING` (page not in the crawl) or `BAD-GOLD` (quote not even in
+  the original snapshot). It also flags temporal / `stale_risk: high` items on changed pages and passed
+  `valid_until` dates. Exit code 1 on BROKEN / MISSING / BAD-GOLD, so a pipeline can stop before scoring.
+  Pages are matched by the gold's `content_hash` first: several DLI pages differ only in `?q=...`.
 
 ## After changing the eval set: re-run the reference configs
 
@@ -132,6 +140,20 @@ So after changing `eval_set.jsonl`, first re-run the reference configs on the ne
 are cached, about a minute each), for example the MiniLM dedup baseline and the current best config, with
 `--change "re-run <config> on eval set vN"`. New experiments then have a same-version row to compare against.
 To try a candidate eval set without touching the real file: `eval --config ... --eval-file <path>`.
+
+## Dev / test split (held-out evaluation)
+
+`eval_set_v3.jsonl` tags every item `split: dev` or `split: test`. The rule: **tune and compare experiments on
+dev only; read test only to report final numbers** (otherwise the test score is just another tuned number).
+
+`retrieval_eval.py` enforces this by default for eval sets with a `split` field:
+- test items are retrieved, scored and recorded like the others (result rows carry `split`; the run record gets
+  `per_split` with dev and test Hit@5 / Hit@50 / MRR / 0-A-B-C next to the usual all-items metrics);
+- `eval`, `compare` and `table` print dev-only numbers and say how many test questions are hidden; runs shown that
+  way are marked `dev` in the runs table;
+- `--show-test` on any of the three shows everything, including a dev/test table after `eval`.
+
+Eval sets without a `split` field (e.g. `eval_set.jsonl`) behave exactly as before.
 
 ## Check your quotes
 
